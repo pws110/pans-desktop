@@ -143,11 +143,11 @@ enum StoreFailure: LocalizedError {
     case outsideSamples, unsupportedFile, unreadableConfig, unavailableReference, lockedZone
     var errorDescription: String? {
         switch self {
-        case .outsideSamples: return "试用版只接受 TestFiles 里的测试文件。原文件不会被移动。"
-        case .unsupportedFile: return "请拖入可读取的文档、图片或普通文件夹。"
-        case .unreadableConfig: return "配置无法读取，已停止加载，避免覆盖原配置。"
-        case .unavailableReference: return "原文件暂不可用，引用已保留。请检查文件或磁盘是否可用；也可移出旧引用后重新拖入。"
-        case .lockedZone: return "分区已锁定，请先解锁后再移动或增减文件。仍可正常打开和预览。"
+        case .outsideSamples: return L("试用版只接受 TestFiles 里的测试文件。原文件不会被移动。", "This trial accepts only sample files from TestFiles. Original files will not be moved.")
+        case .unsupportedFile: return L("请拖入可读取的文档、图片或普通文件夹。", "Drag in a readable document, image, or ordinary folder.")
+        case .unreadableConfig: return L("配置无法读取，已停止加载，避免覆盖原配置。", "The settings could not be read. Loading has stopped to preserve the original settings.")
+        case .unavailableReference: return L("原文件暂不可用，引用已保留。请检查文件或磁盘是否可用；也可移出旧引用后重新拖入。", "The original file is currently unavailable. Its reference has been kept. Check that the file or disk is available, or remove the old reference and add it again.")
+        case .lockedZone: return L("分区已锁定，请先解锁后再移动或增减文件。仍可正常打开和预览。", "This partition is locked. Unlock it before moving, adding, or removing files. You can still open and preview files.")
         }
     }
 }

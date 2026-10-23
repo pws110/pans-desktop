@@ -46,7 +46,7 @@ enum PartitionDeletionError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notEmpty(let count):
-            return "分区里还有 \(count) 个可用项目，请先移到桌面或其他已解锁分区。空分区或只剩原文件不可用条目的分区可以删除；不会删除原文件。"
+            return L("分区里还有 \(count) 个可用项目，请先移到桌面或其他已解锁分区。空分区或只剩原文件不可用条目的分区可以删除；不会删除原文件。", "This partition still has \(count) available items. Move them to the desktop or another unlocked partition first. Empty partitions and partitions containing only unavailable entries can be deleted. Original files will not be deleted.")
         }
     }
 }

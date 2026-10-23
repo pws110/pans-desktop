@@ -1,0 +1,22 @@
+{
+  "product": "Pan's Desktop",
+  "build": 54,
+  "languages": [
+    "zh-Hans",
+    "en"
+  ],
+  "architecture": "arm64",
+  "minimum_macos_target": "14.0",
+  "private_data_included": false,
+  "sources": {
+    "Sources/CopyExport.swift": "3797d1b8e5adbe1074096fe30a63f6f03e2af677e83c2c9a3e58853905554798",
+    "Sources/DataHome.swift": "818b5b580948f7aac23ef82c2ea15ad8ee70da54a60e34687b89f297c0af0547",
+    "Sources/Info.plist": "4b5268928c6b1524a94bf38981f6d827e09a098b3230606d231b6589c5f48fb4",
+    "Sources/Localization.swift": "ebb783b597dbe3e01aa69407d12cfb5cd3fa22df96e23f30e78a5107a5e92439",
+    "Sources/Model.swift": "4ba76f96a07b0b6ec1d774b80c516a77eceb4fc978f6b26e9dc2dc5a9142765a",
+    "Sources/MoveActions.swift": "f49b75e3edac4a73c18bc5b25e2662a7329b634e1a45bf33be903d4da28f63f2",
+    "Sources/PartitionActions.swift": "fff80d29fe3193268d94532425869c205fdc01de98d7d5b025ab02d65ae8afb1",
+    "Sources/Storage.swift": "cc3ced50d53186ec79bd8a4d4c3d52317855cbb0055ed0596127476f44045bdc",
+    "Sources/main.swift": "54607e7b934ca03608de2e507d29cc2e4ce13cfe71419ef7442d58d465f1360d"
+  }
+}

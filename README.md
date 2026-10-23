@@ -1,10 +1,16 @@
 # Pan's Desktop
 
-一个透明的 macOS 桌面文件分区工具。当前版本：1.0.0（Build 53）。Swift / SwiftUI / AppKit 编写，无第三方依赖，MIT 许可。
+[English](README.en.md) · 中文说明
+
+一个透明的 macOS 桌面文件分区工具。当前版本：1.0.0（Build 54）。Swift / SwiftUI / AppKit 编写，无第三方依赖，MIT 许可。
+
+## 界面语言
+
+软件跟随系统首选语言显示中英文；中文系统保持中文，其他语言使用英文。现有分区名称、文件名、文件位置和设置保持原样，首次新建的默认分区使用相应语言。内部数据文件夹名称保持不变。
 
 ## 下载与安装
 
-1. 从 [Releases 发布页](https://github.com/pws110/pans-desktop/releases/latest) 下载 `PansDesktop-v1.0.0-build53-macOS-arm64.zip`，解压。
+1. 从 [Releases 发布页](https://github.com/pws110/pans-desktop/releases/latest) 下载 `PansDesktop-v1.0.0-build54-macOS-arm64.zip`，解压。
 2. 把整个“Pan's Desktop”文件夹放到你有读写权限的位置，例如个人“文稿”或 `~/Applications/Pan's Desktop`。**保留外层文件夹，不要只把 app 放到系统 `/Applications` 根目录。**
 3. 打开文件夹里的“Pan's Desktop.app”。首次启动会创建新的默认分区。
 4. 每个分区右上角“…”菜单可设置“拖入方式”。想保留原文件位置，选“仅添加引用（原路径不变）”；“收纳文件”模式会移动文件到软件旁边的收纳文件夹。

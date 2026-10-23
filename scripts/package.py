@@ -7,7 +7,7 @@ import zipfile
 
 runtime = pathlib.Path(sys.argv[1]).resolve()
 output = pathlib.Path(sys.argv[2]).resolve()
-allowed = {"Pan's Desktop.app", "LICENSE.txt", "先读我.txt", "先读我.md"}
+allowed = {"Pan's Desktop.app", "LICENSE.txt", "先读我.txt", "先读我.md", "ReadMe-English.md"}
 if {entry.name for entry in runtime.iterdir()} - allowed:
     raise SystemExit("Refusing to package a folder containing runtime/user data.")
 if runtime.is_symlink() or not (runtime / "Pan's Desktop.app/Contents/MacOS/PansDesktop").is_file():

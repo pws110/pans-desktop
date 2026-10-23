@@ -5,10 +5,10 @@ enum CopyExportError: LocalizedError {
     case unavailable, changed, collision, invalidDestination
     var errorDescription: String? {
         switch self {
-        case .unavailable: return "原文件暂不可用，未复制，也未移除分区引用。"
-        case .changed: return "复制期间原文件有变动，请重试。原文件和分区引用均保留。"
-        case .collision: return "目标已有同名文件，未覆盖。请换一个位置或文件名。"
-        case .invalidDestination: return "复制目标不可用，原文件和分区引用均保留。"
+        case .unavailable: return L("原文件暂不可用，未复制，也未移除分区引用。", "The original file is currently unavailable. No copy was made and the partition reference was kept.")
+        case .changed: return L("复制期间原文件有变动，请重试。原文件和分区引用均保留。", "The original file changed while being copied. Try again. The original file and partition reference have been kept.")
+        case .collision: return L("目标已有同名文件，未覆盖。请换一个位置或文件名。", "The destination already has a file with this name. Nothing was overwritten. Choose another location or name.")
+        case .invalidDestination: return L("复制目标不可用，原文件和分区引用均保留。", "The copy destination is unavailable. The original file and partition reference have been kept.")
         }
     }
 }

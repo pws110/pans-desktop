@@ -38,13 +38,13 @@ enum StorageError: LocalizedError {
     case unsupported, unavailable, collision(String), crossVolume, invalidFolder, journal, noUndo, failed(String)
     var errorDescription: String? {
         switch self {
-        case .unsupported: return "可收纳普通文档、图片和文件夹；系统目录、应用及符号链接不能移入。"
-        case .unavailable: return "文件或原位置已变动，请在访达中检查后重试。没有覆盖文件。"
-        case .collision(let name): return "目标已有“\(name)”，未覆盖，也未移动本批文件。请更名或换一个分区。"
-        case .crossVolume: return "收纳暂只支持同一磁盘。外接盘文件请使用仅引用方式。"
-        case .invalidFolder: return "收纳目录已改变或不安全，已停止移动。请查看收纳文件夹。"
-        case .journal: return "操作记录或分区配置无法保存，尚未移动文件。"
-        case .noUndo: return "没有可撤销的收纳操作。"
+        case .unsupported: return L("可收纳普通文档、图片和文件夹；系统目录、应用及符号链接不能移入。", "You can collect ordinary documents, images, and folders. System folders, apps, and symbolic links cannot be moved in.")
+        case .unavailable: return L("文件或原位置已变动，请在访达中检查后重试。没有覆盖文件。", "The file or its original location has changed. Check it in Finder and try again. No files were overwritten.")
+        case .collision(let name): return L("目标已有“\(name)”，未覆盖，也未移动本批文件。请更名或换一个分区。", "The destination already contains “\(name)”. No files in this batch were moved or overwritten. Rename the item or choose another partition.")
+        case .crossVolume: return L("收纳暂只支持同一磁盘。外接盘文件请使用仅引用方式。", "Collect mode currently supports moves on the same disk only. Use references for files on external disks.")
+        case .invalidFolder: return L("收纳目录已改变或不安全，已停止移动。请查看收纳文件夹。", "The storage folder has changed or is unsafe. Moving has stopped. Please check the storage folder.")
+        case .journal: return L("操作记录或分区配置无法保存，尚未移动文件。", "The activity log or partition settings could not be saved. No files have been moved.")
+        case .noUndo: return L("没有可撤销的收纳操作。", "There is no collection action to undo.")
         case .failed(let reason): return reason
         }
     }
@@ -69,7 +69,7 @@ final class StorageEngine {
         self.references = references; self.writer = writer; self.mover = mover; self.deviceOf = device
         if fm.fileExists(atPath: journalURL.path) {
             do { journal = try JSONDecoder().decode(StorageJournal.self, from: Data(contentsOf: journalURL)) }
-            catch { throw StorageError.failed("收纳记录无法读取，已停止收纳，避免覆盖记录。") }
+            catch { throw StorageError.failed(L("收纳记录无法读取，已停止收纳，避免覆盖记录。", "The collection log could not be read. Collection has stopped to preserve the existing log.")) }
         } else { journal = StorageJournal() }
         try ensureRoot()
         for zone in references.zones { _ = try folder(zone.id) }
@@ -103,7 +103,7 @@ final class StorageEngine {
             if renameatx_np(AT_FDCWD, source.path, dst, target.lastPathComponent, UInt32(RENAME_EXCL)) != 0 {
                 if errno == EEXIST { throw StorageError.collision(target.lastPathComponent) }
                 if errno == EXDEV { throw StorageError.crossVolume }
-                throw StorageError.failed("恢复未完成：" + String(cString: strerror(errno)))
+                throw StorageError.failed(L("恢复未完成：", "Restore incomplete: ") + String(cString: strerror(errno)))
             }
             return
         }
@@ -117,7 +117,7 @@ final class StorageEngine {
         if result != 0 {
             if errno == EEXIST { throw StorageError.collision(target.lastPathComponent) }
             if errno == EXDEV { throw StorageError.crossVolume }
-            throw StorageError.failed("移动未完成：" + String(cString: strerror(errno)))
+            throw StorageError.failed(L("移动未完成：", "Move incomplete: ") + String(cString: strerror(errno)))
         }
     }
     func ensureRoot() throws {
@@ -207,7 +207,7 @@ final class StorageEngine {
                references.zones.first(where: { $0.id == id })!.paths.contains(source.path) { continue }
             moves.append(try plan(source, target.appendingPathComponent(source.lastPathComponent), after: [Membership(zone: id, index: references.zones.first { $0.id == id }!.paths.count + moves.count)]))
         }
-        guard Set(moves.map { $0.to.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")) }).count == moves.count else { throw StorageError.collision("同名文件") }
+        guard Set(moves.map { $0.to.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")) }).count == moves.count else { throw StorageError.collision(L("同名文件", "a file with the same name")) }
         let destination = references.zones.first { $0.id == id }!
         var orderChange: ZoneOrderChange?
         if let insertion {
@@ -220,7 +220,7 @@ final class StorageEngine {
             let order = GridOrder.inserting(incoming, into: base, at: insertion, removing: removed)
             orderChange = ZoneOrderChange(zone: id, before: destination.paths, after: order, beforeSort: destination.sortOrder, afterSort: "manual")
         }
-        return try execute(moves, title: "收纳至“\(destination.title)”", kind: "collect", orderChange: orderChange, actionZones: actions)
+        return try execute(moves, title: L("收纳至“\(destination.title)”", "Collect into “\(destination.title)”"), kind: "collect", orderChange: orderChange, actionZones: actions)
     }
     @discardableResult func reorder(_ paths: [String], in id: UUID, at insertion: Int, displayOrder: [String]? = nil) throws -> UUID? {
         guard let zone = references.zones.first(where: { $0.id == id }), !paths.isEmpty,
@@ -230,7 +230,7 @@ final class StorageEngine {
         let desired = GridOrder.inserting(paths, into: base, at: insertion)
         if desired == zone.paths && zone.sortOrder == "manual" { return nil }
         let order = ZoneOrderChange(zone: id, before: zone.paths, after: desired, beforeSort: zone.sortOrder, afterSort: "manual")
-        return try execute([], title: "调整“\(zone.title)”内的排列", kind: "reorder", orderChange: order, actionZones: [id])
+        return try execute([], title: L("调整“\(zone.title)”内的排列", "Reorder items in “\(zone.title)”"), kind: "reorder", orderChange: order, actionZones: [id])
     }
     @discardableResult func transferReferences(_ paths: [String], from source: UUID, to destination: UUID, at insertion: Int, displayOrder: [String]? = nil) throws -> UUID? {
         guard let from = references.zones.first(where: { $0.id == source }),
@@ -249,7 +249,7 @@ final class StorageEngine {
         let removed = Set(moves.flatMap { $0.before }.filter { $0.zone == destination }.compactMap { to.paths.indices.contains($0.index) ? to.paths[$0.index] : nil })
         let desired = GridOrder.inserting(moves.map(\.to), into: GridOrder.normalized(displayOrder, members: to.paths), at: insertion, removing: removed)
         let order = ZoneOrderChange(zone: destination, before: to.paths, after: desired, beforeSort: to.sortOrder, afterSort: "manual")
-        return try execute(moves, title: "转移引用至“\(to.title)”", kind: "reference-transfer", orderChange: order, actionZones: [source, destination])
+        return try execute(moves, title: L("转移引用至“\(to.title)”", "Transfer references to “\(to.title)”"), kind: "reference-transfer", orderChange: order, actionZones: [source, destination])
     }
     private func plansIntoFolder(_ urls: [URL], path: String, in id: UUID, sourceZone: UUID?) throws -> [StorageMove] {
         try validateUnlocked([id] + [sourceZone].compactMap { $0 })
@@ -274,7 +274,7 @@ final class StorageEngine {
     }
     @discardableResult func moveIntoFolder(_ urls: [URL], path: String, in id: UUID, sourceZone: UUID? = nil) throws -> UUID? {
         let moves = try plansIntoFolder(urls, path: path, in: id, sourceZone: sourceZone)
-        return try execute(moves, title: "移入文件夹“\(URL(fileURLWithPath: path).lastPathComponent)”", kind: "folder-move", actionZones: [id] + [sourceZone].compactMap { $0 })
+        return try execute(moves, title: L("移入文件夹“\(URL(fileURLWithPath: path).lastPathComponent)”", "Move into folder “\(URL(fileURLWithPath: path).lastPathComponent)”"), kind: "folder-move", actionZones: [id] + [sourceZone].compactMap { $0 })
     }
     func matches(_ path: String, _ expected: FileIdentity) -> Bool { Self.movableItem(URL(fileURLWithPath: path)) && (try? FileIdentity(url: URL(fileURLWithPath: path))) == expected }
     func locate(_ move: StorageMove) -> URL? {
@@ -293,7 +293,7 @@ final class StorageEngine {
             moves.append(try plan(current, URL(fileURLWithPath: move.from), after: move.before))
         }
         let actions = record.actionZones ?? legacyActionZones(record)
-        return try execute(moves, title: "撤销：" + record.title, kind: "undo", reverses: record.id, orderChange: record.orderChange?.reversed, actionZones: actions)
+        return try execute(moves, title: L("撤销：", "Undo: ") + record.title, kind: "undo", reverses: record.id, orderChange: record.orderChange?.reversed, actionZones: actions)
     }
     func originalLocation(_ url: URL) -> (String, [Membership])? {
         guard isManaged(url), let identity = try? FileIdentity(url: url) else { return nil }
@@ -305,14 +305,14 @@ final class StorageEngine {
     }
     @discardableResult func returnToOriginal(_ url: URL, sourceZone: UUID? = nil) throws -> UUID? {
         guard let origin = originalLocation(url) else { throw StorageError.unavailable }
-        return try execute([plan(url, URL(fileURLWithPath: origin.0), after: origin.1)], title: "放回原位置", kind: "return", actionZones: [sourceZone].compactMap { $0 })
+        return try execute([plan(url, URL(fileURLWithPath: origin.0), after: origin.1)], title: L("放回原位置", "Return to Original Location"), kind: "return", actionZones: [sourceZone].compactMap { $0 })
     }
     // Explicit move-out also handles legacy references already on the Desktop:
     // the physical file stays there and only the zone memberships are removed.
     @discardableResult func moveOut(_ url: URL, to target: URL, sourceZone: UUID? = nil) throws -> UUID? {
         try validateImport(url)
         guard !target.standardizedFileURL.path.hasPrefix(root.path + "/") else { throw StorageError.invalidFolder }
-        return try execute([plan(url, target, after: [])], title: "移出分区至“\(target.deletingLastPathComponent().lastPathComponent)”", kind: "export-move", actionZones: [sourceZone].compactMap { $0 })
+        return try execute([plan(url, target, after: [])], title: L("移出分区至“\(target.deletingLastPathComponent().lastPathComponent)”", "Move out of partition to “\(target.deletingLastPathComponent().lastPathComponent)”"), kind: "export-move", actionZones: [sourceZone].compactMap { $0 })
     }
     @discardableResult func moveOut(_ urls: [URL], toDirectory directory: URL, sourceZone: UUID? = nil) throws -> UUID? {
         guard !directory.standardizedFileURL.path.hasPrefix(root.path + "/") else { throw StorageError.invalidFolder }
@@ -324,7 +324,7 @@ final class StorageEngine {
             guard names.insert(key).inserted else { throw StorageError.collision(url.lastPathComponent) }
             moves.append(try plan(url, directory.appendingPathComponent(url.lastPathComponent), after: []))
         }
-        return try execute(moves, title: "移出 \(moves.count) 个文件至“\(directory.lastPathComponent)”", kind: "export-move", actionZones: [sourceZone].compactMap { $0 })
+        return try execute(moves, title: L("移出 \(moves.count) 个文件至“\(directory.lastPathComponent)”", "Move \(moves.count) items out to “\(directory.lastPathComponent)”"), kind: "export-move", actionZones: [sourceZone].compactMap { $0 })
     }
     // Finder owns the actual native file-URL move. Reconcile only after the same
     // file identity is verified at its new location; a cancelled drag does nothing.
@@ -337,7 +337,7 @@ final class StorageEngine {
         let raw = StorageMove(from: original.path, to: found.url.path, identity: tracking.identity,
                               device: try Self.device(found.url), tracking: tracking, before: before, after: [])
         let move = preservingOtherLockedReferences([raw], excluding: [sourceZone].compactMap { $0 })[0]
-        var record = StorageRecord(title: "拖出分区移动", kind: "external-move", moves: [move])
+        var record = StorageRecord(title: L("拖出分区移动", "Move out by dragging"), kind: "external-move", moves: [move])
         record.actionZones = [sourceZone].compactMap { $0 }
         record.state = "pending"
         let old = references.zones
@@ -351,13 +351,13 @@ final class StorageEngine {
             references.zones = old
             try? references.save()
             journal.records[journal.records.count - 1].state = "attention"; try? saveJournal()
-            throw StorageError.failed("文件已由访达移动，分区记录未全部保存。文件仍保留在“\(found.url.path)”，请刷新后核对。")
+            throw StorageError.failed(L("文件已由访达移动，分区记录未全部保存。文件仍保留在“\(found.url.path)”，请刷新后核对。", "Finder moved the file, but not all partition records were saved. The file remains at “\(found.url.path)”. Refresh and check the records."))
         }
     }
     static func recycle(_ url: URL) throws -> URL {
         var result: NSURL?
         try FileManager.default.trashItem(at: url, resultingItemURL: &result)
-        guard let result else { throw StorageError.failed("已调用废纸篓，但未取得恢复位置，请在访达核对。") }
+        guard let result else { throw StorageError.failed(L("已调用废纸篓，但未取得恢复位置，请在访达核对。", "Trash was requested, but the restore location was not returned. Please check in Finder.")) }
         return result as URL
     }
     // Use the macOS Trash API so Finder's Put Back remains available. The journal
@@ -369,7 +369,7 @@ final class StorageEngine {
         let actions = [sourceZone].compactMap { $0 }
         try validateUnlocked(actions)
         var move = preservingOtherLockedReferences([try plan(url, placeholder, after: [])], excluding: actions)[0]
-        var record = StorageRecord(title: "移到废纸篓：" + url.lastPathComponent, kind: "trash", moves: [move])
+        var record = StorageRecord(title: L("移到废纸篓：", "Move to Trash: ") + url.lastPathComponent, kind: "trash", moves: [move])
         record.actionZones = actions
         try references.save()
         journal.records.append(record)
@@ -394,7 +394,7 @@ final class StorageEngine {
             if restored { do { try references.save() } catch { restored = false } }
             journal.records[journal.records.count - 1].state = restored ? "cancelled" : "attention"
             try? saveJournal()
-            throw StorageError.failed(restored ? "移到废纸篓未完成，文件和分区项目已保留。" : "移到废纸篓的记录未完成，文件未被永久删除，请在废纸篓和操作记录中核对。")
+            throw StorageError.failed(restored ? L("移到废纸篓未完成，文件和分区项目已保留。", "Moving to Trash did not complete. The file and partition entry have been kept.") : L("移到废纸篓的记录未完成，文件未被永久删除，请在废纸篓和操作记录中核对。", "The Trash operation was not fully recorded. The file was not permanently deleted. Check Trash and Activity History."))
         }
     }
     private func apply(_ moves: [StorageMove], forward: Bool, orderChange: ZoneOrderChange? = nil) throws {
@@ -469,7 +469,7 @@ final class StorageEngine {
         for (index, move) in moves.enumerated() {
             guard !moves.enumerated().contains(where: { otherIndex, other in
                 otherIndex != index && (move.from.hasPrefix(other.from + "/") || move.to.hasPrefix(other.from + "/"))
-            }) else { throw StorageError.failed("不能同时移动一个文件夹及其内部项目，请只选择外层文件夹。") }
+            }) else { throw StorageError.failed(L("不能同时移动一个文件夹及其内部项目，请只选择外层文件夹。", "A folder and its contents cannot be moved together. Select only the outer folder.")) }
         }
         try ensureRoot()
         for move in moves {
@@ -508,8 +508,8 @@ final class StorageEngine {
             if restored { do { try references.save() } catch { restored = false } }
             journal.records[journal.records.count - 1].state = restored ? "cancelled" : "attention"
             try? saveJournal()
-            if restored { throw StorageError.failed("操作未完成，本批移动已撤回。" + error.localizedDescription) }
-            throw StorageError.failed("操作未全部完成，已保留文件和记录。请在“操作记录”核对原位置与收纳位置，没有覆盖文件。")
+            if restored { throw StorageError.failed(L("操作未完成，本批移动已撤回。", "The action did not complete. All moves in this batch were rolled back. ") + error.localizedDescription) }
+            throw StorageError.failed(L("操作未全部完成，已保留文件和记录。请在“操作记录”核对原位置与收纳位置，没有覆盖文件。", "The action did not fully complete. Files and records have been kept. Check original and storage locations in Activity History. No files were overwritten."))
         }
     }
     private func recoverByObservation() throws {

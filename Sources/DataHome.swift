@@ -3,7 +3,7 @@ import Foundation
 enum AppDataHomeError: LocalizedError {
     case unavailable
     var errorDescription: String? {
-        "找不到原来的 Pan's Desktop 数据文件夹。为保留现有分区，已停止启动；请恢复原文件夹后重试。没有创建替代分区或移动文件。"
+        L("找不到原来的 Pan's Desktop 数据文件夹。为保留现有分区，已停止启动；请恢复原文件夹后重试。没有创建替代分区或移动文件。", "The original Pan's Desktop data folder could not be found. Startup has stopped to preserve your partitions. Restore that folder and try again. No replacement partitions were created and no files were moved.")
     }
 }
 

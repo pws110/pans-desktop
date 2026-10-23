@@ -1,0 +1,12 @@
+_build/
+dist/
+.DS_Store
+*.app/
+*.dmg
+*.zip
+Configuration/
+TestFiles/
+收纳文件/
+*.log
+
+_build.noindex/

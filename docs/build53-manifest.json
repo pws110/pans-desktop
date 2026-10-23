@@ -1,0 +1,25 @@
+{
+  "product": "Pan's Desktop",
+  "version": "1.0.0",
+  "build": 53,
+  "architecture": "arm64",
+  "minimum_macos_target": "14.0",
+  "personal_data_included": false,
+  "sources": {
+    "Sources/Storage.swift": "2f08d5b57a26a6e676bfd9ac7187b194b89e6499bd6bd568266ac4518835ce7f",
+    "Sources/Model.swift": "69e12c665cd0c064f6b66cd771034656efc86ea248c401aa097203477e3bd1ae",
+    "Sources/DataHome.swift": "c0b7731607a7b33a2ee44934033177f9cdc3162a724855ad7312d9561d055d3a",
+    "Sources/MoveActions.swift": "f49b75e3edac4a73c18bc5b25e2662a7329b634e1a45bf33be903d4da28f63f2",
+    "Sources/CopyExport.swift": "16ec18665d57a56ac6c4872519dcf317cc0c053935d2075a55b3e4a5b3d4156b",
+    "Sources/main.swift": "694b0ae5b64061dbe4c64c578836e398a84ba3ac486198830a87f45e4c9deaa7",
+    "Sources/Info.plist": "674cbb2335a92e3d0320ca3a14f8d2bd9a9c85abc8880692b5389302bffb35d5",
+    "Sources/PartitionActions.swift": "2bb741bbd349aef4b3fe98aa7b2d7fb0703800ec47a44b6253e04fbd6830f67f"
+  },
+  "assets": {
+    "AppIcon-source.png": "c963ecb9a04ed0c2f65b75aea1c263c787c6f6173df55baecbfc01f53a6a5563",
+    "AppIcon.icns": "79f057c2cc6734e0c11cff101212fd95fdee9a7ead14011b177e418ad79aaa63",
+    "AppIcon.png": "d1678b5267ffd69f98b9869ee63636205d9f1073b1b2e21e68a5c47196204758"
+  },
+  "portable_binary_sha256": "8ed01dd2823abfe3b22b9c40318684a93a724f274bcec14702e4bd0caeab5d4b",
+  "installed_executable_matches_compiled_code_except_local_signature": true
+}

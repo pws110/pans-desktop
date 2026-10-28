@@ -108,6 +108,6 @@ let managed = try state.storage.folder(b).appendingPathComponent(aFiles[0].lastP
 let wanted = [bFiles[0].path,aFiles[1].path,aFiles[2].path,managed.path,bFiles[1].path,folder.path]
 try require(state.zone(b).paths == wanted && !fm.fileExists(atPath:aFiles[0].path),"native physical insertion commits exact grid order and source disappears")
 try state.storage.undo();state.revision += 1;pump()
-try require(NSWorkspace.shared.frontmostApplication?.processIdentifier == front && state.panels.values.allSatisfy { $0.styleMask.contains(.nonactivatingPanel) && $0.level == state.desktopLevel && !$0.canBecomeMain && !$0.isFloatingPanel },"native callbacks preserve nonactivation and desktop layer")
+try require(NSWorkspace.shared.frontmostApplication?.processIdentifier == front && state.panels.values.allSatisfy { $0.level == state.desktopLevel && $0.canBecomeMain },"drag callbacks preserve the current app and desktop layer")
 for p in state.panels.values {p.delegate=nil;p.orderOut(nil)}
 print("ALL NATIVE GRID/FOLDER CALLBACK TESTS PASSED; system mouse gesture is separate")

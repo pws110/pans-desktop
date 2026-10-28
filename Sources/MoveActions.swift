@@ -1,7 +1,7 @@
 import AppKit
 
-// Finder receives the actual URL and a move-only operation mask, rather than a
-// promise that creates a copy. Our private payload takes priority between zones.
+// Finder receives actual URLs, allowing move, Option-copy, and Trash. Our
+// private payload takes priority for reordering and transfers between zones.
 final class FileMoveItem: NSObject, NSPasteboardWriting {
     let source: URL
     let tracking: TrackedReference

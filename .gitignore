@@ -10,3 +10,9 @@ TestFiles/
 *.log
 
 _build.noindex/
+
+*.bookmark
+.env
+.env.*
+*.pem
+*.key

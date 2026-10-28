@@ -64,7 +64,15 @@ struct GridDropTarget: Equatable {
     var folderPath: String? = nil
 }
 enum GridDropLayout {
-    static let rowHeight: Double = 122
+    // Icon (42), icon/name gap (4), two-line name (29) and vertical padding (6).
+    // No space is reserved for the removed metadata row.
+    static let rowHeight: Double = 81
+    static let spacing: Double = 3
+    static let padding: Double = 10
+    static var pitch: Double { rowHeight + spacing }
+    static func columnCount(width: Double) -> Int {
+        max(1, Int((width - 2 * padding + spacing) / pitch))
+    }
     static func target(at point: CGPoint, cells: [GridDropCell], order: [String]) -> GridDropTarget {
         let indices = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
         let available = cells.filter { indices[$0.path] != nil && !$0.rect.isEmpty }
@@ -180,7 +188,7 @@ final class ReferenceStore {
            !["app", "framework", "bundle"].contains(resolved.pathExtension.lowercased()),
            fm.isReadableFile(atPath: path) { return path }
         let ext = resolved.pathExtension.lowercased()
-        let documents: Set<String> = ["pdf", "txt", "md", "markdown", "rtf", "doc", "docx", "odt", "pages", "xls", "xlsx", "ods", "numbers", "ppt", "pptx", "odp", "key", "csv", "tsv", "epub"]
+        let documents: Set<String> = ["pdf", "txt", "md", "markdown", "rtf", "doc", "docx", "odt", "pages", "xls", "xlsx", "ods", "numbers", "ppt", "pptx", "odp", "key", "csv", "tsv", "epub", "zip", "alias"]
         let type = UTType(filenameExtension: ext)
         guard values.isRegularFile == true, fm.isReadableFile(atPath: path),
               documents.contains(ext) || type?.conforms(to: .image) == true else { throw StoreFailure.unsupportedFile }
@@ -354,12 +362,13 @@ extension Zone {
     mutating func setFrame(_ frame: ZoneFrame) { x = frame.x; y = frame.y; width = frame.width; height = frame.height }
     func contentFrame(on screen: ZoneFrame, itemCount: Int, extraHeight: Double = 0) -> ZoneFrame {
         let base = frameValue
-        let overhead = 110.0 + extraHeight, rowHeight = 132.0, columnWidth = 86.0
-        let currentColumns = max(1, Int((width - 40) / columnWidth))
-        let currentRows = max(1, Int((height - overhead + 10) / rowHeight))
+        let overhead = 82.0 + 2 * GridDropLayout.padding + extraHeight, rowHeight = GridDropLayout.pitch, columnWidth = GridDropLayout.pitch
+        let gap = GridDropLayout.spacing, horizontalPadding = 2 * GridDropLayout.padding
+        let currentColumns = GridDropLayout.columnCount(width: width)
+        let currentRows = max(1, Int((height - overhead + gap) / rowHeight))
         guard itemCount > max(2, currentColumns * currentRows) else { return base }
-        let maxColumns = max(1, Int((screen.width - 40) / columnWidth))
-        let maxRows = max(1, Int((screen.height - overhead + 10) / rowHeight))
+        let maxColumns = GridDropLayout.columnCount(width: screen.width)
+        let maxRows = max(1, Int((screen.height - overhead + gap) / rowHeight))
         let expandedWidth: Double, expandedHeight: Double
         if itemCount >= maxColumns * maxRows {
             expandedWidth = screen.width; expandedHeight = screen.height
@@ -368,8 +377,8 @@ extension Zone {
             let columnsToFitHeight = Int(ceil(Double(itemCount) / Double(maxRows)))
             let columns = min(maxColumns, max(currentColumns, max(balanced, columnsToFitHeight)))
             let rows = Int(ceil(Double(itemCount) / Double(columns)))
-            expandedWidth = min(screen.width, max(width, 40 + Double(columns) * columnWidth))
-            expandedHeight = min(screen.height, max(height, overhead + Double(rows) * rowHeight - 10))
+            expandedWidth = min(screen.width, max(width, horizontalPadding + Double(columns) * columnWidth - gap))
+            expandedHeight = min(screen.height, max(height, overhead + Double(rows) * rowHeight - gap))
         }
         // Keep the top edge and the nearest horizontal screen edge as anchors.
         // Only shift farther when the expanded content reaches the screen edge.

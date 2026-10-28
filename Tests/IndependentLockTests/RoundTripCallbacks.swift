@@ -99,7 +99,7 @@ for sample in samples {
     let drag = incoming([sample], to: lockedDrop)
     try require(lockedDrop.proposed(drag).isEmpty && !lockedDrop.prepareForDragOperation(drag) && !lockedDrop.performDragOperation(drag) && fm.fileExists(atPath: sample.path) && locksRemain(), "locked target rejects without changing sample: " + sample.lastPathComponent)
 }
-try require(state.panels.values.allSatisfy { $0.styleMask.contains(.nonactivatingPanel) && $0.level == state.desktopLevel && !$0.canBecomeMain && !$0.isFloatingPanel }, "test callbacks retain production desktop window policy")
+try require(state.panels.values.allSatisfy { !$0.styleMask.contains(.nonactivatingPanel) && $0.level == state.desktopLevel && $0.canBecomeMain }, "test callbacks retain production desktop window policy")
 try require(state.storage.records.allSatisfy { $0.moves.allSatisfy { $0.from.hasPrefix(root.path + "/") && $0.to.hasPrefix(root.path + "/") } }, "all filesystem operations confined to newly created isolated test home")
 for panel in state.panels.values { panel.delegate = nil; panel.orderOut(nil) }
 print("ALL ONE-UNLOCKED ROUND-TRIP CALLBACK TESTS PASSED; system mouse gesture not automated")

@@ -194,7 +194,7 @@ func testStorageAndGeometry() throws {
         check(expanded.x >= screen.x && expanded.y >= screen.y && expanded.x + expanded.width <= screen.x + screen.width && expanded.y + expanded.height <= screen.y + screen.height, "expanded zone escaped visible screen")
         if count <= 48 {
             check(expanded.x > screen.x && expanded.x + expanded.width == start.x + start.width, "small expansion jumped to the left edge instead of retaining right anchor")
-            check(expanded.y + expanded.height == start.y + start.height, "small expansion lost top anchor")
+            check(expanded.y == max(screen.y, start.y + start.height - expanded.height), "expansion lost top anchor before reaching the screen edge")
         }
         zone.toggleMaximum(on: screen, itemCount: count); zone.toggleMaximum(on: screen)
         check(zone.frameValue == start && !zone.isMaximized, "adaptive expand did not restore original position")

@@ -303,6 +303,40 @@ final class StorageEngine {
         }
         return nil
     }
+    @discardableResult func renameFile(_ url: URL, name: String, sourceZone: UUID) throws -> UUID? {
+        try validateUnlocked([sourceZone]); try validateImport(url)
+        let target = url.deletingLastPathComponent().appendingPathComponent(try FileActionEngine.name(name))
+        let members = memberships(url, identity: try FileIdentity(url: url))
+        return try execute([plan(url, target, after: members)], title: L("重新命名：", "Rename: ") + target.lastPathComponent, kind: "rename", actionZones: [sourceZone])
+    }
+    static func verifiedTrashURL(_ tracking: TrackedReference) -> URL? {
+        var stale = false
+        var candidates: [URL] = []
+        if let found = try? URL(resolvingBookmarkData: tracking.bookmark, options: [.withoutUI, .withoutMounting], relativeTo: nil, bookmarkDataIsStale: &stale) { candidates.append(found) }
+        if let value = tracking.fileReferenceURL, let found = URL(string: value) { candidates.append(found.standardizedFileURL) }
+        return candidates.first(where: { ($0.pathComponents.contains(".Trash") || $0.pathComponents.contains(".Trashes")) && (try? FileIdentity(url: $0)) == tracking.identity })
+    }
+    @discardableResult func finishExternalTrash(_ original: URL, tracking: TrackedReference, sourceZone: UUID) throws -> Bool {
+        try validateUnlocked([sourceZone])
+        guard !Self.exists(original.path), let target = Self.verifiedTrashURL(tracking) else { throw StorageError.unavailable }
+        let before = memberships(original, identity: tracking.identity)
+        guard before.contains(where: { $0.zone == sourceZone }) else { return true }
+        let raw = StorageMove(from: original.path, to: target.path, identity: tracking.identity, device: try Self.device(target), tracking: tracking, before: before, after: [])
+        let move = preservingOtherLockedReferences([raw], excluding: [sourceZone])[0]
+        var record = StorageRecord(title: L("移到废纸篓：", "Move to Trash: ") + original.lastPathComponent, kind: "trash", moves: [move])
+        record.actionZones = [sourceZone]
+        let old = references.zones
+        journal.records.append(record)
+        do { try saveJournal() } catch { journal.records.removeLast(); throw StorageError.journal }
+        do {
+            try apply([move], forward: true)
+            journal.records[journal.records.count - 1].state = "done"; try saveJournal(); return true
+        } catch {
+            references.zones = old; try? references.save()
+            journal.records[journal.records.count - 1].state = "attention"; try? saveJournal()
+            throw error
+        }
+    }
     @discardableResult func returnToOriginal(_ url: URL, sourceZone: UUID? = nil) throws -> UUID? {
         guard let origin = originalLocation(url) else { throw StorageError.unavailable }
         return try execute([plan(url, URL(fileURLWithPath: origin.0), after: origin.1)], title: L("放回原位置", "Return to Original Location"), kind: "return", actionZones: [sourceZone].compactMap { $0 })

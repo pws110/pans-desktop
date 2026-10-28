@@ -1,6 +1,6 @@
 # Pan's Desktop
 
-[中文说明](README.md) · **1.0.0, Build 54** · MIT license
+[中文说明](README.md) · **1.0.0, Build 77** · MIT license
 
 A transparent desktop partition app for macOS, written in Swift, SwiftUI, and AppKit with no third-party dependencies.
 
@@ -10,7 +10,7 @@ The interface follows your preferred system language: Chinese for Chinese langua
 
 ## Download and install
 
-1. Open the [latest release](https://github.com/pws110/pans-desktop/releases/latest) and download `PansDesktop-v1.0.0-build54-macOS-arm64.zip`.
+1. Open the [latest release](https://github.com/pws110/pans-desktop/releases/latest) and download `PansDesktop-v1.0.0-build77-macOS-arm64.zip`.
 2. Extract it. Keep the **entire outer “Pan's Desktop” folder** in a writable location, such as Documents or `~/Applications/Pan's Desktop`. Do not move just the app into the system `/Applications` root: the clean portable app stores its data next to itself.
 3. Open `Pan's Desktop.app` inside that folder. A fresh installation creates new default partitions.
 4. Choose an **Import Mode** from each partition's **More (···)** menu. **Add References Only (Keep Originals)** preserves the original file locations. **Collect Files (Move, Undo Available)** moves files into the app's storage folder. Check the mode before adding your own files.
@@ -27,7 +27,7 @@ The app uses a local ad-hoc signature. It has **no Apple Developer ID signature 
 - Grid-aligned ordering and transfers between unlocked partitions.
 - Move items into folders within unlocked partitions.
 - Partitions stay at the desktop layer when you open a document. An expanded partition appears in front of other partitions.
-- Large white PAN lettering on a red icon. The running app hides its Dock icon and remains accessible from its menu-bar menu.
+- Large white PAN lettering on a red icon. The app remains accessible from its Dock icon and menu-bar menu.
 
 A locked partition keeps its position and blocks moving, adding, and removing files. Opening, previewing, collapsing, expanding, and restoring its size remain available. Unlock only the partitions involved in a move.
 
@@ -63,3 +63,15 @@ These checks create temporary test files. Additional interaction tests are in `T
 Only software, source, icon assets, synthetic tests, and documentation are published. No personal documents, private partition settings, original-file path lists, activity logs, or same-Mac reinstall packages are included.
 
 Release downloads include `SHA256SUMS.txt` for checking integrity. Keep personal backups private.
+
+## Current behavior in Build 77
+
+- Hover enlarges the icon and complete filename over a transparent background. Long names wrap downward; neighboring files remain visible and do not activate through the expanded text.
+- Only the filename appears below each icon. Grid cells are 81 × 81 points with equal 3-point horizontal and vertical gaps; normal icons remain 44 × 42 points.
+- Clicking a partition hides other visible application windows; clicking blank partition space again restores the applications hidden in that session. Applications keep running and partitions stay in place.
+- Every partition can shrink to one column. Narrow headers move collapse, expand, and lock commands into the More menu.
+- The More button remains an ellipsis. Its native menu and submenus open independently of partition width, with complete command text.
+
+## Validation
+
+Build 77 passed 91 isolated native checks. An observed popup was 222 points wide beside a 116-point partition. Live system hide/restore behavior was verified in Build 74; later builds retain that logic. Isolated checks are not a claim of compatibility with every third-party application. See the [Build 77 release notes](docs/发布说明-build77.md).

@@ -6,13 +6,45 @@ import ImageIO
 
 let referenceType = "com.andy.clearzones.reference"
 
-// A desktop surface must not activate our app when clicked. Activating a normal
-// window exits macOS's wallpaper/Show Desktop mode and restores hidden windows.
-final class ZonePanel: NSPanel {
+enum PartitionWindowLayout {
+    // Keep one complete grid cell plus its existing margins, even when macOS
+    // reserves a legacy scrollbar gutter instead of using an overlay scroller.
+    static var minimumWidth: CGFloat {
+        GridDropLayout.rowHeight + 2 * GridDropLayout.padding
+            + NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+    }
+}
+
+// A clicked partition must accept normal app focus while showing the desktop.
+// Returning to desktop level on app switches keeps other documents usable.
+final class ZonePanel: NSWindow {
     weak var controller: AppState?
+    private var restoreClickOrigin: NSPoint?
     override func keyDown(with event: NSEvent) { if event.keyCode == 53 { controller?.backToDesktop() } else { super.keyDown(with: event) } }
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .scrollWheel { controller?.hideHover() }
+        if event.type == .leftMouseDown {
+            controller?.desktopVisibility.confirmRestoration()
+            restoreClickOrigin = nil
+            if controller?.desktopVisibility.isActive == true, let contentView,
+               contentView.hitTest(contentView.convert(event.locationInWindow, from: nil)) is SelectionSurface {
+                restoreClickOrigin = event.locationInWindow
+            } else { controller?.revealDesktopForInteraction(in: self) }
+        } else if [.rightMouseDown, .otherMouseDown].contains(event.type) {
+            restoreClickOrigin = nil
+            controller?.revealDesktopForInteraction(in: self)
+        } else if event.type == .leftMouseDragged, let origin = restoreClickOrigin,
+                  hypot(event.locationInWindow.x - origin.x, event.locationInWindow.y - origin.y) > 4 {
+            restoreClickOrigin = nil
+        }
+        super.sendEvent(event)
+        if event.type == .leftMouseUp, restoreClickOrigin != nil {
+            restoreClickOrigin = nil
+            controller?.restoreDesktopApplications()
+        }
+    }
     override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeMain: Bool { true }
 }
 final class PreviewWindow: NSWindow {
     override func keyDown(with event: NSEvent) { if event.keyCode == 53 { orderOut(nil) } else { super.keyDown(with: event) } }
@@ -28,6 +60,17 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
     var partitionArchive: PartitionArchive!
     var historyWindow: NSWindow?
     var previewWindow: NSWindow?
+    var clickTracker = TileClickTracker()
+    var sharingPickers: [NSSharingServicePicker] = []
+    var pendingDesktopReveal = false
+    var desktopFocusMode = false
+    var desktopRevealGeneration = 0
+    let desktopVisibility = DesktopVisibilitySession()
+    var desktopReturnApplication: NSRunningApplication?
+    var lastExternalApplication: NSRunningApplication?
+    weak var desktopFocusPanel: ZonePanel?
+    var revealDesktopTestHook: (() -> Void)?
+    var openReferenceTestHook: ((URL, Bool) -> Void)?
     var selectedPath: String?
     var selectedPaths: Set<String> = []
     let tileViews = NSHashTable<ReferenceTileView>.weakObjects()
@@ -35,8 +78,10 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
     var handledDragSessions: Set<UUID> = []
     var selectedZone: UUID?
     var fileOperationRunning = false
+    @Published var hoveredFile: (zone: UUID, path: String)?
     var hoverPanel: NSPanel?
     weak var hoverOwner: ReferenceTileView?
+    var hoverPointerTimer: Timer?
     var panels: [UUID: ZonePanel] = [:]
     var frontExpandedZone: UUID?
     var status: NSStatusItem!
@@ -89,16 +134,17 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
         }
     }
     var sampleRoot: URL { home.appendingPathComponent("TestFiles", isDirectory: true) }
-    func keepDockHidden() {
-        if NSApp.activationPolicy() != .accessory { NSApp.setActivationPolicy(.accessory) }
+    func keepApplicationAvailable() {
+        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
     }
     func applicationDidFinishLaunching(_ notification: Notification) { startUI() }
     func startUI() {
         guard !started else { return }
         started = true
-        keepDockHidden()
-        DispatchQueue.main.async { [weak self] in self?.keepDockHidden() }
+        keepApplicationAvailable()
+        DispatchQueue.main.async { [weak self] in self?.keepApplicationAvailable() }
         trace("startup did-finish")
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != ProcessInfo.processInfo.processIdentifier { lastExternalApplication = front }
         do {
             _ = try dataHome.get()
             let config = home.appendingPathComponent("Configuration/zones.json")
@@ -116,7 +162,12 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
                 guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                       application.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
                 self?.trace("external-application-activated bundle=\(application.bundleIdentifier ?? "unknown") pid=\(application.processIdentifier)")
-                self?.returnZonesToDesktop(reason: "external-app-activated")
+                self?.lastExternalApplication = application
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, !self.pendingDesktopReveal,
+                          NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier else { return }
+                    self.returnZonesToDesktop(reason: "external-app-activated")
+                }
             }
             let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.refreshReferences() }
             timer.tolerance = 1
@@ -137,6 +188,7 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
         try store.save()
     }
     func installMenu() {
+        NSApp.registerServicesMenuSendTypes([.fileURL, .string, NSPasteboard.PasteboardType("NSFilenamesPboardType")], returnTypes: [])
         let main = NSMenu(), item = NSMenuItem(), menu = NSMenu()
         menu.autoenablesItems = false
         for (title, action, key) in [(L("把分区带到前面", "Bring Partitions Forward"), #selector(showInFront), ""), (L("放回桌面层", "Return to Desktop Layer"), #selector(backToDesktop), ""), (L("新增分区（向右排列）", "Add Partition to the Right"), #selector(addZone), ""), (L("恢复上次删除的分区", "Restore Last Deleted Partition"), #selector(restorePartition), ""), (L("添加到待处理…", "Add to Inbox…"), #selector(addToInbox), ""), (L("撤销上次操作", "Undo Last Action"), #selector(undoStorage), ""), (L("操作记录", "Activity History"), #selector(showHistory), ""), (L("打开收纳文件夹", "Open Storage Folder"), #selector(openStorage), ""), (L("刷新文件引用", "Refresh File References"), #selector(refreshReferences), ""), (L("退出Pan's Desktop", "Quit Pan's Desktop"), #selector(quit), "q")] {
@@ -161,7 +213,7 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
     }
     func makePanel(_ zone: Zone) {
         loading = true
-        let panel = ZonePanel(contentRect: NSRect(x: zone.x, y: zone.y, width: zone.width, height: zone.height), styleMask: [.titled, .fullSizeContentView, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
+        let panel = ZonePanel(contentRect: NSRect(x: zone.x, y: zone.y, width: zone.width, height: zone.height), styleMask: [.titled, .fullSizeContentView, .resizable], backing: .buffered, defer: false)
         panel.controller = self
         panel.title = "Pan's Desktop · \(zone.title)"; panel.isOpaque = false
         panel.backgroundColor = NSColor.black.withAlphaComponent(0.08)
@@ -171,9 +223,9 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
         panel.setFrame(NSRect(x: zone.x, y: zone.y, width: zone.width, height: zone.height), display: false)
         panel.ignoresMouseEvents = false; panel.acceptsMouseMovedEvents = true
         panel.hasShadow = false; panel.hidesOnDeactivate = false; panel.isReleasedWhenClosed = false
-        panel.isFloatingPanel = false; panel.becomesKeyOnlyIfNeeded = true
+        panel.animationBehavior = .none
         panel.isMovable = !zone.locked
-        panel.isMovableByWindowBackground = false; panel.minSize = NSSize(width: 240, height: zone.isCollapsed ? 48 : 180)
+        panel.isMovableByWindowBackground = false; panel.minSize = NSSize(width: PartitionWindowLayout.minimumWidth, height: zone.isCollapsed ? 48 : 180)
         panel.collectionBehavior = [.canJoinAllSpaces, .canJoinAllApplications, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         panel.level = desktopLevel
         let hosting = NSHostingView(rootView: ZoneView(app: self, id: zone.id))
@@ -204,8 +256,8 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
         revision += 1
     }
     func persist() { do { try store.save() } catch { alert(L("保存失败", "Unable to Save"), error.localizedDescription) } }
-    func windowDidMove(_ notification: Notification) { remember(notification) }
-    func windowDidResize(_ notification: Notification) { remember(notification) }
+    func windowDidMove(_ notification: Notification) { hideHover(); remember(notification) }
+    func windowDidResize(_ notification: Notification) { hideHover(); remember(notification) }
     func remember(_ notification: Notification) {
         guard !loading, let panel = notification.object as? ZonePanel, let pair = panels.first(where: { $0.value === panel }) else { return }
         let saved = zone(pair.key)
@@ -244,33 +296,86 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
     }
     func hideHover(_ owner: ReferenceTileView? = nil) {
         if let owner, hoverOwner !== owner { return }
-        hoverPanel?.orderOut(nil); hoverOwner = nil
+        hoverPointerTimer?.invalidate(); hoverPointerTimer = nil
+        hoverPanel?.orderOut(nil)
+        hoverOwner = nil
+        if hoveredFile != nil { hoveredFile = nil }
+    }
+    func hoverContains(_ point: NSPoint) -> Bool {
+        guard let owner = hoverOwner, let window = owner.window, window.isVisible,
+              !owner.visibleRect.intersection(owner.bounds).isEmpty else { return false }
+        let anchor = window.convertToScreen(owner.convert(owner.visibleRect.intersection(owner.bounds), to: nil))
+        return anchor.contains(point) || (hoverPanel?.isVisible == true && hoverPanel!.frame.insetBy(dx: -2, dy: -2).contains(point))
+    }
+    func enterHover(_ owner: ReferenceTileView, at point: NSPoint, trackPointer: Bool = true) {
+        // Expanded names keep their owner even when a lower tile receives a
+        // native mouse-enter event through the transparent preview window.
+        if hoverContains(point) { return }
+        hideHover()
+        showHover(owner)
+        if trackPointer, hoverOwner != nil {
+            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+                self?.updateHover(at: NSEvent.mouseLocation)
+            }
+            hoverPointerTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+    func exitHover(_ owner: ReferenceTileView, at point: NSPoint) {
+        guard hoverOwner === owner, !hoverContains(point) else { return }
+        updateHover(at: point)
+    }
+    func updateHover(at point: NSPoint, trackPointer: Bool = true) {
+        guard hoverOwner != nil else { return }
+        if referenceDragInProgress || NSEvent.pressedMouseButtons != 0 { hideHover(); return }
+        if hoverContains(point) { return }
+        let previousWindow = hoverOwner?.window
+        hideHover()
+        // The timer also catches leaving the name into a tile whose initial
+        // mouse-enter was intentionally ignored. Never change any grid frame.
+        if let next = tileViews.allObjects.first(where: { tile in
+            guard !tile.fileURLSource, tile.window === previousWindow,
+                  let window = tile.window, window.isVisible, !tile.isHiddenOrHasHiddenAncestor else { return false }
+            let visible = tile.visibleRect.intersection(tile.bounds)
+            return !visible.isEmpty && window.convertToScreen(tile.convert(visible, to: nil)).contains(point)
+        }) { enterHover(next, at: point, trackPointer: trackPointer) }
     }
     func showHover(_ owner: ReferenceTileView) {
-        guard !referenceDragInProgress, NSEvent.pressedMouseButtons == 0, let source = owner.window, owner.superview != nil else { return }
-        let name = URL(fileURLWithPath: owner.path).lastPathComponent
+        guard !referenceDragInProgress, NSEvent.pressedMouseButtons == 0,
+              let source = owner.window, owner.superview != nil else { return }
         let anchor = source.convertToScreen(owner.convert(owner.bounds, to: nil))
         let screen = (source.screen ?? NSScreen.main)?.visibleFrame ?? source.frame
-        let width = min(270, max(name.count > 42 ? 240 : 150, anchor.width * 1.25))
-        let textRect = (name as NSString).boundingRect(with: NSSize(width: width - 26, height: 800), options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium)])
-        let height = min(screen.height - 20, max(118, ceil(textRect.height) + 100 + ceil(textRect.height / 14)))
-        let x = min(max(anchor.midX - width / 2, screen.minX + 8), screen.maxX - width - 8)
-        let y = min(max(anchor.midY - height / 2, screen.minY + 8), screen.maxY - height - 8)
+        let content = FullNameHoverView(name: URL(fileURLWithPath: owner.path).lastPathComponent,
+                                        icon: owner.icon ?? NSWorkspace.shared.icon(forFile: owner.path),
+                                        availableSize: screen.insetBy(dx: 8, dy: 8).size)
+        let size = content.frame.size
+        // Preserve the icon's baseline; only shift the preview at screen edges
+        // so every line of the full name remains visible.
+        let desiredTop = anchor.maxY - 3 + (content.iconSize.height - 42) + FullNameHoverView.inset
+        let x = min(max(anchor.midX - size.width / 2, screen.minX + 8), screen.maxX - size.width - 8)
+        let y = min(max(desiredTop - size.height, screen.minY + 8), screen.maxY - size.height - 8)
         let panel = hoverPanel ?? NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true
-        panel.animationBehavior = .none; panel.ignoresMouseEvents = true; panel.hidesOnDeactivate = false; panel.isReleasedWhenClosed = false
+        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
+        panel.animationBehavior = .none; panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false; panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.level = NSWindow.Level(rawValue: source.level.rawValue + 1)
-        panel.contentView = NSHostingView(rootView: HoverCard(name: name, icon: owner.icon ?? NSWorkspace.shared.icon(forFile: owner.path)).frame(width: width, height: height))
-        panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
-        hoverPanel = panel; hoverOwner = owner; panel.orderFrontRegardless()
+        panel.contentView = content
+        panel.setFrame(NSRect(origin: NSPoint(x: x, y: y), size: size), display: true)
+        hoverPanel = panel; hoverOwner = owner
+        // Only replace the current tile's visuals. Every neighbor stays drawn
+        // in its original place underneath this transparent full-name preview.
+        if hoveredFile?.zone != owner.zone || hoveredFile?.path != owner.path {
+            hoveredFile = (zone: owner.zone, path: owner.path)
+        }
+        panel.orderFrontRegardless()
     }
     func applyPanelGeometry(_ id: UUID) {
         hideHover()
         guard let panel = panels[id] else { return }
         let z = zone(id); loading = true
         panel.isMovable = !z.locked
-        panel.minSize = NSSize(width: 240, height: z.isCollapsed ? 48 : 180)
+        panel.minSize = NSSize(width: PartitionWindowLayout.minimumWidth, height: z.isCollapsed ? 48 : 180)
         if z.locked || z.isCollapsed || z.isMaximized { panel.styleMask.remove(.resizable) } else { panel.styleMask.insert(.resizable) }
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] { panel.standardWindowButton(type)?.isHidden = true }
         panel.setFrame(NSRect(x: z.x, y: z.y, width: z.width, height: z.height), display: true)
@@ -342,6 +447,12 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
         performFileOperation { _ = try storage.trash(url, sourceZone: id); selectedPath = nil; selectedPaths = []; selectedZone = nil }
     }
     func finishNativeMove(_ item: FileMoveItem, sourceZone: UUID? = nil, attempts: Int = 240) {
+        // Some Finder/Dock versions report a completed Trash drop as .move.
+        // Reconcile only a bookmark whose exact file identity is now in Trash.
+        if let sourceZone, !StorageEngine.exists(item.source.path), StorageEngine.verifiedTrashURL(item.tracking) != nil {
+            performFileOperation { _ = try storage.finishExternalTrash(item.source, tracking: item.tracking, sourceZone: sourceZone) }
+            return
+        }
         // A drop into another zone has already been committed by StorageEngine.
         if let found = ReferenceStore.resolve(item.source.path, tracking: item.tracking, root: sampleRoot, allowPersonalFiles: true), found.url.path != item.source.path, storage.isManaged(found.url) { return }
         do {
@@ -389,6 +500,7 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
             refreshReferences(); alert(L("原文件暂不可用", "Original File Unavailable"), StoreFailure.unavailableReference.localizedDescription); return
         }
         returnZonesToDesktop(reason: reveal ? "reveal-reference" : "open-reference")
+        if let openReferenceTestHook { openReferenceTestHook(url, reveal); return }
         if reveal { NSWorkspace.shared.activateFileViewerSelecting([url]) }
         else { trace("open-reference-request " + url.lastPathComponent); let accepted = NSWorkspace.shared.open(url); trace("open-reference-dispatched accepted=\(accepted)") }
         refreshReferences()
@@ -412,8 +524,13 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
             }
         }
     }
-    func applicationDidBecomeActive(_ notification: Notification) { keepDockHidden(); if started { refreshReferences() } }
-    func applicationDidResignActive(_ notification: Notification) { returnZonesToDesktop(reason: "app-resigned") }
+    func applicationDidBecomeActive(_ notification: Notification) { keepApplicationAvailable(); finishDesktopRevealIfReady(); if started { refreshReferences() } }
+    func applicationDidResignActive(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.pendingDesktopReveal, !NSApp.isActive else { return }
+            self.returnZonesToDesktop(reason: "app-resigned")
+        }
+    }
     func highlightDrop(_ id: UUID?, target: GridDropTarget? = nil) {
         hoveredZone = id
         for view in dropViews.allObjects {
@@ -511,25 +628,36 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
     func logDesktopWindows(_ action: String) {
         for zone in store.zones {
             guard let p = panels[zone.id] else { continue }
-            trace("window-state \(action) title=\(zone.title) window=\(p.windowNumber) frame=\(p.frame) level=\(p.level.rawValue) visible=\(p.isVisible) activeSpace=\(p.isOnActiveSpace) occlusion=\(p.occlusionState.rawValue) nonactivating=\(p.styleMask.contains(.nonactivatingPanel)) floating=\(p.isFloatingPanel) mainCapable=\(p.canBecomeMain) locked=\(zone.locked) movable=\(p.isMovable)")
+            trace("window-state \(action) title=\(zone.title) window=\(p.windowNumber) frame=\(p.frame) level=\(p.level.rawValue) visible=\(p.isVisible) activeSpace=\(p.isOnActiveSpace) occlusion=\(p.occlusionState.rawValue) nonactivating=\(p.styleMask.contains(.nonactivatingPanel)) mainCapable=\(p.canBecomeMain) locked=\(zone.locked) movable=\(p.isMovable)")
         }
     }
     @objc func showInFront() {
         hideHover()
         trialWindow?.orderOut(nil); preview = true; showing = true
-        NSApp.activate(ignoringOtherApps: true)
-        for p in panels.values { p.level = .normal; p.orderFrontRegardless() }
+        desktopFocusMode = true
+        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+        NSApp.activate()
+        for p in panels.values { p.collectionBehavior = [.canJoinAllSpaces, .primary, .stationary, .ignoresCycle]; p.level = .normal; p.orderFrontRegardless() }
+        panels.values.first(where: { $0.isVisible && $0.isOnActiveSpace })?.makeKeyAndOrderFront(nil)
         raiseExpandedPartitions()
         DispatchQueue.main.async { self.logDesktopWindows("front") }
     }
     // Only change our own window levels; never reorder an external document,
     // cancel a drag, or mutate file references when the user changes apps.
     func returnZonesToDesktop(reason: String) {
+        pendingDesktopReveal = false
+        desktopRevealGeneration += 1
+        desktopFocusMode = false
+        desktopFocusPanel = nil
         hideHover()
         let changed = preview || panels.values.contains { $0.level != desktopLevel }
         preview = false
-        for panel in panels.values { panel.level = desktopLevel }
+        for panel in panels.values {
+            panel.level = desktopLevel
+            panel.collectionBehavior = [.canJoinAllSpaces, .canJoinAllApplications, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        }
         trialWindow?.level = .normal
+        keepApplicationAvailable()
         raiseExpandedPartitions()
         if changed || reason == "open-reference" || reason == "preview-reference" {
             trace("zones-returned-to-desktop reason=" + reason)
@@ -543,11 +671,11 @@ final class AppState: NSObject, ObservableObject, NSApplicationDelegate, NSWindo
     @objc func quit() { NSApp.terminate(nil) }
     func alert(_ title: String, _ text: String) { let a = NSAlert(); a.messageText = title; a.informativeText = text; a.addButton(withTitle: L("好", "OK")); NSApp.activate(ignoringOtherApps: true); a.runModal() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        keepDockHidden()
-        DispatchQueue.main.async { [weak self] in self?.keepDockHidden() }
+        keepApplicationAvailable()
+        DispatchQueue.main.async { [weak self] in self?.keepApplicationAvailable() }
         showInFront(); return true
     }
-    func applicationWillTerminate(_ notification: Notification) { referenceTimer?.invalidate(); if let workspaceActivationObserver { NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver) }; if store != nil { persist() } }
+    func applicationWillTerminate(_ notification: Notification) { desktopVisibility.restore(); referenceTimer?.invalidate(); if let workspaceActivationObserver { NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver) }; if store != nil { persist() } }
 }
 
 // Only empty space starts a selection rectangle. File tiles, controls, the
@@ -574,7 +702,7 @@ final class SelectionSurface: NSView {
     }
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard area.contains(point), NSApp.currentEvent?.type != .scrollWheel else { return nil }
-        if tiles.contains(where: { convert($0.visibleRect.intersection($0.bounds), from: $0).insetBy(dx: -5, dy: -30).contains(point) }) { return nil }
+        if tiles.contains(where: { convert($0.visibleRect.intersection($0.bounds), from: $0).contains(point) }) { return nil }
         // NSView.hitTest takes a point in its superview's coordinates. The
         // SwiftUI hosting view is flipped; converting into it inverted the
         // search-row hit test and let the selection layer steal those clicks.
@@ -666,7 +794,7 @@ final class DropContainer: NSView {
     let guide = GridDropGuide()
     init(app: AppState, zoneID: UUID, hosting: NSView) {
         self.app = app; self.zoneID = zoneID; self.hosting = hosting
-        let initialSize = NSSize(width: max(240, hosting.frame.width), height: max(180, hosting.frame.height))
+        let initialSize = NSSize(width: max(PartitionWindowLayout.minimumWidth, hosting.frame.width), height: max(180, hosting.frame.height))
         super.init(frame: NSRect(origin: .zero, size: initialSize))
         wantsLayer = true; layer?.cornerRadius = 18; app.dropViews.add(self)
         addSubview(hosting)
@@ -780,6 +908,29 @@ final class DropContainer: NSView {
     }
 }
 
+// Alignment applies only to an intentional title drag. Existing layouts,
+// startup, resizing and locked windows never pass through this helper.
+enum PartitionAlignment {
+    static let threshold: CGFloat = 12
+    static func origin(for frame: NSRect, beside others: [NSRect]) -> NSPoint {
+        let nearby = others.filter { frame.insetBy(dx: -threshold, dy: -threshold).intersects($0) }
+        func nearest(_ offsets: [CGFloat]) -> CGFloat {
+            offsets.filter { abs($0) <= threshold }.min { abs($0) < abs($1) } ?? 0
+        }
+        // Match top with top, never bottom with bottom.
+        let dy = nearest(nearby.map { $0.maxY - frame.maxY })
+        let positioned = frame.offsetBy(dx: 0, dy: dy)
+        var xOffsets = nearby.map { $0.minX - frame.minX }
+        for other in nearby where min(positioned.maxY, other.maxY) > max(positioned.minY, other.minY) {
+            // Adjacent outer borders touch, with no extra padding or overlap.
+            // This is adjacency, not right-edge alignment.
+            xOffsets.append(other.maxX - frame.minX)
+            xOffsets.append(other.minX - frame.maxX)
+        }
+        return NSPoint(x: frame.minX + nearest(xOffsets), y: frame.minY + dy)
+    }
+}
+
 struct TitleDrag: NSViewRepresentable {
     let app: AppState; let id: UUID
     func makeNSView(context: Context) -> TitleDragView { let v = TitleDragView(); v.app = app; v.id = id; return v }
@@ -803,23 +954,53 @@ final class TitleDragView: NSView {
     override func mouseDragged(with event: NSEvent) {
         guard gestureStarted, let app, !app.zone(id).locked, !app.zone(id).isMaximized, let window else { return }
         let point = window.convertPoint(toScreen: event.locationInWindow)
-        window.setFrameOrigin(NSPoint(x: origin.x + point.x - start.x, y: origin.y + point.y - start.y))
+        let proposed = NSRect(origin: NSPoint(x: origin.x + point.x - start.x, y: origin.y + point.y - start.y), size: window.frame.size)
+        let neighbors = app.store.zones.compactMap { zone -> NSRect? in
+            guard zone.id != id, let panel = app.panels[zone.id], panel.isVisible else { return nil }
+            return panel.frame
+        }
+        window.setFrameOrigin(PartitionAlignment.origin(for: proposed, beside: neighbors))
     }
     override func mouseUp(with event: NSEvent) { gestureStarted = false; app?.traceDesktopInput("title-up") }
 }
 struct ResizeHandle: NSViewRepresentable {
     let locked: Bool
-    func makeNSView(context: Context) -> ResizeView { let v = ResizeView(); v.locked = locked; return v }
-    func updateNSView(_ view: ResizeView, context: Context) { view.locked = locked }
+    var onHover: (Bool) -> Void = { _ in }
+    func makeNSView(context: Context) -> ResizeView { let v = ResizeView(); configure(v); return v }
+    func updateNSView(_ view: ResizeView, context: Context) { configure(view) }
+    func configure(_ view: ResizeView) {
+        view.locked = locked; view.onHover = onHover
+        view.setAccessibilityLabel(L("调整分区大小", "Resize Partition"))
+    }
 }
 final class ResizeView: NSView {
-    var locked = false; var origin = NSRect.zero; var start = NSPoint.zero
-    override func mouseDown(with event: NSEvent) { guard !locked, let window else { return }; origin = window.frame; start = window.convertPoint(toScreen: event.locationInWindow) }
+    var locked = false { didSet { if locked { gestureStarted = false } } }
+    var origin = NSRect.zero; var start = NSPoint.zero
+    var gestureStarted = false
+    var onHover: ((Bool) -> Void)?
+    private var hoverArea: NSTrackingArea?
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { bounds.contains(convert(point, from: superview)) ? self : nil }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area); hoverArea = area
+    }
+    override func mouseEntered(with event: NSEvent) { onHover?(true) }
+    override func mouseExited(with event: NSEvent) { onHover?(false) }
+    override func mouseDown(with event: NSEvent) {
+        gestureStarted = false
+        guard !locked, let window else { return }
+        origin = window.frame; start = window.convertPoint(toScreen: event.locationInWindow); gestureStarted = true
+    }
     override func mouseDragged(with event: NSEvent) {
-        guard !locked, let window else { return }; let p = window.convertPoint(toScreen: event.locationInWindow)
-        let width = max(240, origin.width + p.x - start.x); let height = max(180, origin.height - p.y + start.y)
+        guard gestureStarted, !locked, let window else { return }; let p = window.convertPoint(toScreen: event.locationInWindow)
+        let width = max(PartitionWindowLayout.minimumWidth, max(window.minSize.width, origin.width + p.x - start.x)); let height = max(180, origin.height - p.y + start.y)
         window.setFrame(NSRect(x: origin.minX, y: origin.maxY - height, width: width, height: height), display: true)
     }
+    override func mouseUp(with event: NSEvent) { gestureStarted = false }
 }
 struct TileInteraction: NSViewRepresentable {
     let app: AppState; let zone: UUID; let path: String; let icon: NSImage
@@ -832,6 +1013,8 @@ struct TileInteraction: NSViewRepresentable {
 final class ReferenceTileView: NSView, NSDraggingSource {
     weak var app: AppState?; var zone = UUID(); var path = ""; var icon: NSImage?
     var dragging = false
+    var mouseDownPoint = NSPoint.zero
+    var clickCancelled = false
     var fileURLSource = false
     var hoverTrackingArea: NSTrackingArea?
     var exportsFileMove = false
@@ -847,22 +1030,39 @@ final class ReferenceTileView: NSView, NSDraggingSource {
     }
     override func mouseEntered(with event: NSEvent) {
         guard !dragging, !fileURLSource, NSEvent.pressedMouseButtons == 0 else { return }
-        app?.showHover(self)
+        app?.enterHover(self, at: NSEvent.mouseLocation)
     }
-    override func mouseExited(with event: NSEvent) { app?.hideHover(self) }
+    override func mouseExited(with event: NSEvent) { app?.exitHover(self, at: NSEvent.mouseLocation) }
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil { app?.hideHover(self) }
         super.viewWillMove(toWindow: newWindow)
     }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        if !fileURLSource, let app {
+            let fromTop = isFlipped ? local.y : bounds.height - local.y
+            let missing = app.store.unavailable.contains(path)
+            if fromTop >= bounds.height - 22 && missing { return nil }
+        }
+        return self
+    }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var acceptsFirstResponder: Bool { true }
     override var needsPanelToBecomeKey: Bool { true }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains(.command), !fileURLSource else { return super.performKeyEquivalent(with: event) }
+        let action: String?
+        switch event.charactersIgnoringModifiers?.lowercased() { case "c": action = "copy"; case "d": action = "duplicate"; case "i": action = "info"; default: action = nil }
+        if let action { executeFileAction(action); return true }
+        return super.performKeyEquivalent(with: event)
+    }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 51, event.modifierFlags.contains(.command), !fileURLSource, let app {
             if app.store.resolvedURL(path, in: zone) == nil { app.remove(path, zone) }
             else { app.trashFile(path, in: zone) }
-        }
-        else if event.keyCode == 49, !fileURLSource { app?.previewReference(path, in: zone) }
+        } else if event.keyCode == 49, !fileURLSource { app?.previewReference(path, in: zone) }
+        else if (event.keyCode == 36 || (event.keyCode == 125 && event.modifierFlags.contains(.command))), !fileURLSource { app?.openReference(path, in: zone) }
         else { super.keyDown(with: event) }
     }
     override func mouseDown(with event: NSEvent) {
@@ -875,19 +1075,24 @@ final class ReferenceTileView: NSView, NSDraggingSource {
             let preserve = pendingCommandToggle || (modifiers.isEmpty && app.selectedZone == zone && app.selectedPaths.contains(path) && app.selectedPaths.count > 1)
             if !preserve { app.selectFile(path, in: zone, modifiers: modifiers, order: orderedPaths) }
         }
-        dragging = false
+        dragging = false; clickCancelled = false; mouseDownPoint = convert(event.locationInWindow, from: nil)
         app?.trace("source-down selection=\(app?.selectedPaths.count ?? 0) modifiers=\(event.modifierFlags.rawValue)")
-        if event.clickCount == 2 {
-            if fileURLSource { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
-            else { app?.openReference(path, in: zone) }
-        }
     }
     override func mouseUp(with event: NSEvent) {
         if pendingCommandToggle, !dragging { app?.selectFile(path, in: zone, modifiers: .command, order: orderedPaths) }
         pendingCommandToggle = false
+        guard !dragging, !clickCancelled else { app?.clickTracker.cancel(); return }
+        let point = window?.convertPoint(toScreen: event.locationInWindow) ?? event.locationInWindow
+        if app?.clickTracker.released(key: zone.uuidString + path, time: event.timestamp, point: point, systemClicks: event.clickCount, modifiers: event.modifierFlags) == true {
+            if fileURLSource { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
+            else { app?.openReference(path, in: zone) }
+        }
     }
     override func mouseDragged(with event: NSEvent) {
         guard !dragging else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        guard hypot(point.x - mouseDownPoint.x, point.y - mouseDownPoint.y) >= 7 else { return }
+        clickCancelled = true; app?.clickTracker.cancel()
         app?.hideHover(); pendingCommandToggle = false
         var items: [NSDraggingItem] = []
         moveItems = []; exportsFileMove = false
@@ -911,7 +1116,6 @@ final class ReferenceTileView: NSView, NSDraggingSource {
         guard !items.isEmpty else { return }
         dragging = true; app?.referenceDragInProgress = true
         app?.trace("source-drag files=\(items.count) window=\(window?.windowNumber ?? -1)")
-        let point = convert(event.locationInWindow, from: nil)
         for (index, item) in items.enumerated() {
             let offset = Double(min(index, 3)) * 7
             item.setDraggingFrame(NSRect(x: point.x - 24 + offset, y: point.y - 24 - offset, width: 48, height: 48), contents: fileURLSource ? icon : app?.fileImage(moveItems[index].source.path))
@@ -926,7 +1130,11 @@ final class ReferenceTileView: NSView, NSDraggingSource {
         app?.highlightDrop(nil); app?.trace("source-end operation=\(operation.rawValue) count=\(moveItems.count) screen=(\(screenPoint.x),\(screenPoint.y))")
         let internalDrop = dragSessionID.flatMap { app?.handledDragSessions.remove($0) } != nil
         dragSessionID = nil
-        if operation.contains(.move), !internalDrop { for item in moveItems { app?.finishNativeMove(item, sourceZone: zone) } }
+        if !internalDrop, operation.contains(.delete), let app {
+            let items = moveItems
+            app.performFileOperation { try FileActionEngine(store: app.store, storage: app.storage).finishTrashDrag(items, in: zone) }
+        } else if operation.contains(.move), !internalDrop { for item in moveItems { app?.finishNativeMove(item, sourceZone: zone) } }
+        // A copy or cancelled drag preserves every original and partition reference.
         moveItems = []
         if let app, app.selectedZone == zone { app.setSelection(app.selectedPaths, in: zone) }
         app?.refreshReferences()
@@ -935,53 +1143,12 @@ final class ReferenceTileView: NSView, NSDraggingSource {
         if let app, !fileURLSource, app.zone(zone).locked { return [] }
         if context == .withinApplication { return [.copy, .move] }
         guard exportsFileMove, let app, !app.zone(zone).locked else { return [] }
-        return .move
+        return [.copy, .move, .delete]
     }
-    func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
-    override func menu(for event: NSEvent) -> NSMenu? {
-        guard let app, !fileURLSource else { return nil }
-        let menu = NSMenu()
-        func add(_ title: String, _ operation: String) {
-            let item = NSMenuItem(title: title, action: #selector(runAction(_:)), keyEquivalent: "")
-            item.target = self; item.representedObject = operation; menu.addItem(item)
-        }
-        if app.selectedZone != zone || !app.selectedPaths.contains(path) { app.setSelection([path], in: zone, anchor: path) }
-        add(L("快速预览（空格）", "Quick Look (Space)"), "preview"); add(L("打开", "Open"), "open"); add(L("在访达中显示", "Show in Finder"), "reveal")
-        let currentURL = URL(fileURLWithPath: path)
-        let unlocked = !app.zone(zone).locked
-        let available = app.store.resolvedURL(path, in: zone) != nil
-        if unlocked, available, app.storage.isManaged(currentURL), app.storage.originalLocation(currentURL) != nil { add(L("放回原位置", "Return to Original Location"), "return") }
-        else if unlocked, available, app.zone(zone).usesStorage { add(L("收纳此文件到本分区", "Collect This File into This Partition"), "collect") }
-        let submenu = NSMenu()
-        for z in app.store.zones where unlocked && available && z.id != zone && !z.locked {
-            let item = NSMenuItem(title: z.title, action: #selector(runAction(_:)), keyEquivalent: "")
-            item.target = self; item.representedObject = z.id.uuidString; submenu.addItem(item)
-        }
-        if unlocked && available { let move = NSMenuItem(title: L("移到分区", "Move to Partition"), action: nil, keyEquivalent: ""); move.submenu = submenu; menu.addItem(move) }
-        menu.addItem(.separator())
-        if unlocked && available { add(L("移到桌面（原分区不保留）", "Move to Desktop (Remove from Partition)"), "desktop"); add(app.actionPaths(path, in: zone).count > 1 ? L("移到废纸篓（仅此文件）", "Move to Trash (This File Only)") : L("移到废纸篓（可恢复）", "Move to Trash (Recoverable)"), "trash") }
-        if unlocked { add(available ? L("仅移除本区引用（不删除文件）", "Remove Reference Only (Keep File)") : L("移除失效条目（不删除原文件）", "Remove Unavailable Entry (Keep Original)"), "remove") }
-        return menu
-    }
-    @objc func runAction(_ sender: NSMenuItem) {
-        guard let operation = sender.representedObject as? String, let app else { return }
-        guard ["preview", "open", "reveal"].contains(operation) || !app.zone(zone).locked else { return }
-        switch operation {
-        case "preview": app.previewReference(path, in: zone)
-        case "return": app.returnOriginal(path, in: zone)
-        case "collect": if let url = app.store.resolvedURL(path, in: zone) { app.importFiles([url], to: zone, from: zone) }
-        case "open": app.openReference(path, in: zone)
-        case "reveal": app.openReference(path, in: zone, reveal: true)
-        case "desktop": app.moveToDesktop(path, in: zone)
-        case "trash": app.trashFile(path, in: zone)
-        case "remove": app.remove(path, zone)
-        default: if let destination = UUID(uuidString: operation) {
-            guard !app.zone(destination).locked else { return }
-            if let urls = try? app.resolvedBatch(app.actionPaths(path, in: zone), in: zone), app.zone(destination).usesStorage { app.importFiles(urls, to: destination, from: zone) }
-            else { do { try app.store.transfer(app.actionPaths(path, in: zone), from: zone, to: destination); app.revision += 1 } catch { app.alert(L("无法移动所选项目", "Unable to Move Selected Items"), error.localizedDescription) } }
-        }
-        }
-    }
+    func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { false }
+    override func menu(for event: NSEvent) -> NSMenu? { makeFileMenu() }
+    @objc func runAction(_ sender: NSMenuItem) { if let operation = sender.representedObject as? String { executeFileAction(operation) } }
+
 }
 struct TestBasket: View {
     @ObservedObject var app: AppState
@@ -1027,8 +1194,8 @@ final class WideSearchField: NSSearchField {
     }
     func focusForTyping() {
         guard let window else { return }
-        // A key nonactivating panel can edit text without activating the app
-        // and restoring the windows hidden by macOS Show Desktop.
+        // Keep search editing in the clicked partition without reopening
+        // applications whose windows were hidden by the desktop interaction.
         window.makeKey()
         window.makeFirstResponder(self)
         (currentEditor() as? NSTextView)?.insertionPointColor = .white
@@ -1091,6 +1258,19 @@ struct ZoneSearchField: NSViewRepresentable {
         }
     }
 }
+enum PartitionHeaderLayout {
+    static let height: CGFloat = 38
+    static let titleSize: CGFloat = 13
+    static let buttonSize: CGFloat = 34
+    static func isNarrow(width: CGFloat) -> Bool { width < 240 }
+    static func isCompact(width: CGFloat, title: String, count: Int, layoutControls: Bool) -> Bool {
+        let font = NSFont.systemFont(ofSize: titleSize, weight: .bold)
+        let titleWidth = min(130, max(52, ceil((title as NSString).size(withAttributes: [.font: font]).width)))
+        let countWidth = ceil((String(count) as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 10)]).width) + 4
+        let controls: CGFloat = layoutControls ? 5 : 3
+        return width < 20 + controls * buttonSize + controls * 2 + titleWidth + countWidth
+    }
+}
 // The complete visible hover box is part of the control label, so plain
 // buttons and the menu accept clicks throughout the same enlarged rectangle.
 struct HeaderButtonIcon: View {
@@ -1105,6 +1285,56 @@ struct HeaderButtonIcon: View {
             .contentShape(Rectangle())
             .animation(.easeOut(duration: 0.1), value: hovered)
     }
+}
+struct ControlHoverBackground: View {
+    let hovered: Bool
+    var body: some View {
+        RoundedRectangle(cornerRadius: 8).fill(.white.opacity(hovered ? 0.16 : 0))
+            .overlay { RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(hovered ? 0.12 : 0), lineWidth: 0.7) }
+            .allowsHitTesting(false)
+    }
+}
+// A real 34-point control makes the complete hover background clickable,
+// including the empty space around the lock symbol in a desktop panel.
+struct HeaderLockButton: NSViewRepresentable {
+    let app: AppState; let id: UUID; let locked: Bool
+    var onHover: (Bool) -> Void = { _ in }
+    func makeNSView(context: Context) -> HeaderLockControl { let view = HeaderLockControl(); configure(view); return view }
+    func updateNSView(_ view: HeaderLockControl, context: Context) { configure(view) }
+    func configure(_ view: HeaderLockControl) {
+        view.onToggle = { [weak app] in app?.lock(id) }
+        view.onHover = onHover
+        view.image = NSImage(systemSymbolName: locked ? "lock.fill" : "lock.open", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
+        let label = locked ? L("解锁分区", "Unlock Partition") : L("锁定分区", "Lock Partition")
+        view.setAccessibilityLabel(label)
+        view.toolTip = locked ? L("点击解锁，允许移动分区和文件", "Unlock to move the partition and its files") : L("点击锁定，固定分区和文件", "Lock the partition and its files")
+    }
+}
+final class HeaderLockControl: NSButton {
+    var onToggle: (() -> Void)?
+    var onHover: ((Bool) -> Void)?
+    var isHovered = false { didSet { needsDisplay = true } }
+    private var hoverArea: NSTrackingArea?
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 34, height: 34))
+        title = ""; isBordered = false; bezelStyle = .regularSquare; imagePosition = .imageOnly
+        contentTintColor = .white; focusRingType = .none
+        target = self; action = #selector(toggleLock)
+    }
+    required init?(coder: NSCoder) { nil }
+    override var intrinsicContentSize: NSSize { NSSize(width: 34, height: 34) }
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0) }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { bounds.contains(convert(point, from: superview)) ? self : nil }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area); hoverArea = area
+    }
+    override func mouseEntered(with event: NSEvent) { isHovered = true; onHover?(true) }
+    override func mouseExited(with event: NSEvent) { isHovered = false; onHover?(false) }
+    @objc func toggleLock() { onToggle?() }
 }
 // Native menus can consume hover events before SwiftUI receives them.
 // Track the menu rectangle without intercepting any clicks or menu actions.
@@ -1128,6 +1358,67 @@ struct MenuHoverTracker: NSViewRepresentable {
         override func mouseExited(with event: NSEvent) { onHover(false) }
     }
 }
+// A native menu measures its own text independently of the 34-point trigger
+// and the partition width. Submenus receive the same full-label sizing.
+enum PartitionMenuLayout {
+    static func fit(_ menu: NSMenu) {
+        menu.autoenablesItems = false
+        let font = menu.font ?? NSFont.menuFont(ofSize: 0)
+        menu.font = font
+        let widest = menu.items.filter { !$0.isSeparatorItem }.map {
+            ($0.title as NSString).size(withAttributes: [.font: font]).width
+        }.max() ?? 0
+        menu.minimumWidth = ceil(widest) + 64 // Checkmark, submenu arrow and margins.
+        for item in menu.items { if let submenu = item.submenu { fit(submenu) } }
+    }
+}
+final class PartitionMenuAction: NSMenuItem {
+    let handler: () -> Void
+    init(_ title: String, enabled: Bool = true, selected: Bool = false, handler: @escaping () -> Void) {
+        self.handler = handler
+        super.init(title: title, action: #selector(invoke), keyEquivalent: "")
+        target = self; isEnabled = enabled; state = selected ? .on : .off
+    }
+    required init(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    @objc func invoke() { if isEnabled { handler() } }
+}
+struct PartitionMenuButton: NSViewRepresentable {
+    let makeMenu: () -> NSMenu
+    let onClose: () -> Void
+    func makeNSView(context: Context) -> PartitionMenuControl { let view = PartitionMenuControl(); configure(view); return view }
+    func updateNSView(_ view: PartitionMenuControl, context: Context) { configure(view) }
+    func configure(_ view: PartitionMenuControl) { view.makeMenu = makeMenu; view.onClose = onClose }
+}
+final class PartitionMenuControl: NSButton {
+    var makeMenu: (() -> NSMenu)?
+    var onClose: (() -> Void)?
+    private var presentedMenu: NSMenu?
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 34, height: 34))
+        title = ""; isBordered = false; bezelStyle = .regularSquare; imagePosition = .imageOnly
+        image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        focusRingType = .none; target = self; action = #selector(openMenu)
+        setAccessibilityRole(.popUpButton); setAccessibilityLabel(L("更多", "More")); toolTip = L("更多", "More")
+    }
+    required init?(coder: NSCoder) { nil }
+    override var intrinsicContentSize: NSSize { NSSize(width: 34, height: 34) }
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0) }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { bounds.contains(convert(point, from: superview)) ? self : nil }
+    @objc func openMenu() {
+        guard presentedMenu == nil, let menu = makeMenu?() else { return }
+        PartitionMenuLayout.fit(menu); presentedMenu = menu
+        DispatchQueue.main.async { [self] in
+            if let window {
+                let anchor = window.convertPoint(toScreen: convert(NSPoint(x: bounds.minX, y: bounds.minY), to: nil))
+                // A view-attached popup can be compressed to its tiny parent
+                // window. Screen coordinates detach it from that width limit.
+                menu.popUp(positioning: nil, at: anchor, in: nil)
+            }
+            presentedMenu = nil; onClose?()
+        }
+    }
+}
 struct ZoneView: View {
     @ObservedObject var app: AppState
     let id: UUID
@@ -1135,6 +1426,7 @@ struct ZoneView: View {
     @State private var searchVisible = false
     @State private var query = ""
     @State private var hoveredHeaderButton: String?
+    @State private var hoveredResize = false
     func headerHover(_ key: String, _ inside: Bool) {
         if inside { hoveredHeaderButton = key }
         else if hoveredHeaderButton == key { hoveredHeaderButton = nil }
@@ -1143,8 +1435,11 @@ struct ZoneView: View {
         z.orderedPaths.filter { query.isEmpty || URL(fileURLWithPath: $0).lastPathComponent.localizedStandardContains(query) }
     }
     var body: some View {
+        GeometryReader { geometry in content(width: geometry.size.width) }
+    }
+    func content(width: CGFloat) -> some View {
         let z = app.zone(id)
-        VStack(spacing: 0) {
+        return VStack(spacing: 0) {
             header(z)
             if !z.isCollapsed || !layoutControls {
                 if searchVisible {
@@ -1159,9 +1454,9 @@ struct ZoneView: View {
                             Text(query.isEmpty ? (z.usesStorage ? L("移入收纳文件夹 · 只保留一份", "Move to storage · Keep one copy") : L("只添加引用 · 保留原路径", "Add references · Keep originals in place")) : L("试试文件名中的其他文字", "Try another part of the file name")).font(.system(size: 10)).opacity(0.7)
                         }.foregroundStyle(.white.opacity(0.7)).frame(maxWidth: .infinity).padding(.top, 38)
                     } else {
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 78, maximum: 100), spacing: 8)], alignment: .leading, spacing: 10) {
+                        LazyVGrid(columns: Array(repeating: GridItem(.fixed(GridDropLayout.rowHeight), spacing: GridDropLayout.spacing, alignment: .top), count: GridDropLayout.columnCount(width: width)), alignment: .leading, spacing: GridDropLayout.spacing) {
                             ForEach(displayed, id: \.self) { path in fileTile(path) }
-                        }.padding(14)
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(GridDropLayout.padding)
                     }
                 }
                 footer(z)
@@ -1176,115 +1471,188 @@ struct ZoneView: View {
         .clipShape(RoundedRectangle(cornerRadius: 18))
     }
     func header(_ z: Zone) -> some View {
-        HStack(spacing: 4) {
-            if layoutControls {
+        GeometryReader { geometry in
+            headerContent(z, compact: PartitionHeaderLayout.isCompact(width: geometry.size.width, title: z.title, count: z.paths.count, layoutControls: layoutControls), narrow: PartitionHeaderLayout.isNarrow(width: geometry.size.width), width: geometry.size.width)
+        }.frame(height: PartitionHeaderLayout.height)
+    }
+    func toggleSearch(_ z: Zone) {
+        searchVisible.toggle()
+        if !searchVisible { query = "" }
+        if z.isCollapsed { app.toggleCollapsed(id) }
+    }
+    func partitionMenu(compact: Bool, narrow: Bool) -> NSMenu {
+        let z = app.zone(id)
+        let menu = NSMenu()
+        func add(_ title: String, enabled: Bool = true, selected: Bool = false, to parent: NSMenu? = nil, action: @escaping () -> Void) {
+            (parent ?? menu).addItem(PartitionMenuAction(title, enabled: enabled, selected: selected, handler: action))
+        }
+        if narrow && layoutControls {
+            add(z.isCollapsed ? L("展开分区", "Expand Partition") : L("收起分区", "Collapse Partition")) { app.toggleCollapsed(id) }
+            add(z.isMaximized ? L("还原分区", "Restore Partition Size") : L("放大分区", "Expand Partition to Fit")) { app.toggleMaximum(id, itemCount: files(z).count, extraHeight: searchVisible ? 46 : 0) }
+            menu.addItem(.separator())
+        }
+        if compact {
+            add(L("本区共 \(z.paths.count) 项", "\(z.paths.count) items in this partition"), enabled: false) {}
+            add(searchVisible ? L("关闭搜索", "Close Search") : L("搜索文件", "Search Files")) { toggleSearch(z) }
+            menu.addItem(.separator())
+        }
+        add(L("添加文档、图片或文件夹", "Add Documents, Images, or Folders"), enabled: !z.locked) { app.chooseFiles(id) }
+        let imports = NSMenu(title: L("拖入方式", "Import Mode"))
+        add(L("收纳文件（移动，可撤销）", "Collect Files (Move, Undo Available)"), selected: z.usesStorage, to: imports) { app.change(id) { $0.organizeFiles = true } }
+        add(L("仅添加引用（原路径不变）", "Add References Only (Keep Originals)"), selected: !z.usesStorage, to: imports) { app.change(id) { $0.organizeFiles = false } }
+        let importItem = NSMenuItem(title: imports.title, action: nil, keyEquivalent: ""); importItem.submenu = imports; menu.addItem(importItem)
+        let sorting = NSMenu(title: L("排序", "Sort By"))
+        for (value, label) in [("manual", L("手动排列（拖动排序）", "Manual Order (Drag to Reorder)")), ("name", L("文件名称", "File Name")), ("modified", L("最近修改", "Last Modified")), ("type", L("文件类型", "File Type"))] {
+            add(label, selected: (z.sortOrder ?? "manual") == value, to: sorting) { app.change(id) { $0.sortOrder = value } }
+        }
+        let sortItem = NSMenuItem(title: sorting.title, action: nil, keyEquivalent: ""); sortItem.submenu = sorting; menu.addItem(sortItem)
+        add(L("打开本区收纳文件夹", "Open This Partition's Storage Folder")) { app.openZoneFolder(id) }
+        menu.addItem(.separator())
+        add(L("重命名分区", "Rename Partition")) { app.rename(id) }
+        add(z.locked ? L("解锁分区（允许移动文件和分区）", "Unlock Partition (Allow Moving Files and Partition)") : L("锁定分区（固定位置与文件）", "Lock Partition (Fix Position and Files)")) { app.lock(id) }
+        add(L("新增分区（向右排列）", "Add Partition to the Right")) { app.addZone() }
+        add(z.paths.isEmpty ? L("删除空分区", "Delete Empty Partition") : L("删除分区", "Delete Partition")) { app.deletePartition(id) }
+        add(L("恢复上次删除的分区", "Restore Last Deleted Partition"), enabled: app.partitionArchive.restorable(in: app.store) != nil) { app.restorePartition() }
+        add(L("撤销上次操作", "Undo Last Action"), enabled: app.storage.undoRecord != nil) { app.undoStorage() }
+        add(L("操作记录", "Activity History")) { app.showHistory() }
+        add(L("放回桌面层", "Return to Desktop Layer")) { app.backToDesktop() }
+        add(L("使用说明", "Help")) { app.help() }
+        PartitionMenuLayout.fit(menu)
+        return menu
+    }
+    func headerContent(_ z: Zone, compact: Bool, narrow: Bool, width: CGFloat) -> some View {
+        HStack(spacing: 2) {
+            if layoutControls && !narrow {
                 Button { app.toggleCollapsed(id) } label: {
                     HeaderButtonIcon(symbol: z.isCollapsed ? "chevron.right" : "chevron.down", hovered: hoveredHeaderButton == "collapse", iconFont: .system(size: 10, weight: .semibold))
                 }.accessibilityLabel(z.isCollapsed ? L("展开分区", "Expand Partition") : L("收起分区", "Collapse Partition")).onHover { headerHover("collapse", $0) }.help(z.isCollapsed ? L("展开分区", "Expand Partition") : L("收起分区", "Collapse Partition"))
             }
-            HStack(spacing: 6) {
-                Text(z.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
-                Text("\(z.paths.count)").font(.system(size: 10)).opacity(0.55)
-                Spacer(minLength: 1)
-            }.frame(maxWidth: .infinity).frame(height: 40)
+            HStack(spacing: 4) {
+                Text(z.title).font(.system(size: PartitionHeaderLayout.titleSize, weight: .bold)).lineLimit(1).truncationMode(.tail).layoutPriority(1)
+                if !compact { Text("\(z.paths.count)").font(.system(size: 10)).opacity(0.55).fixedSize() }
+                Spacer(minLength: 0)
+            }.frame(maxWidth: .infinity, alignment: .leading).frame(height: 34).layoutPriority(1)
+                .frame(width: narrow ? max(1, width - 20 - PartitionHeaderLayout.buttonSize - 2) : nil)
                 .overlay { if layoutControls { TitleDrag(app: app, id: id) } }
-                .help(z.locked ? L("分区已锁定，位置固定；在更多菜单中解锁后可拖动", "Partition locked. Its position is fixed. Unlock it in More to drag it.") : L("拖动标题可自由移动分区", "Drag the title to move the partition"))
-            Button { searchVisible.toggle(); if !searchVisible { query = "" }; if z.isCollapsed { app.toggleCollapsed(id) } } label: {
-                HeaderButtonIcon(symbol: "magnifyingglass", hovered: hoveredHeaderButton == "search")
-            }.accessibilityLabel(L("搜索文件", "Search Files")).onHover { headerHover("search", $0) }.help(L("搜索文件", "Search Files"))
-            if layoutControls {
+                .help(z.title + "\n" + (z.locked ? (narrow ? L("分区已锁定，可在更多菜单中解锁", "Partition locked. Unlock it in the More menu.") : L("分区已锁定，点击右上角锁解锁后可拖动", "Partition locked. Use the upper-right lock to unlock and drag it.")) : L("拖动标题可自由移动分区", "Drag the title to move the partition")))
+            if !compact {
+                Button { toggleSearch(z) } label: {
+                    HeaderButtonIcon(symbol: "magnifyingglass", hovered: hoveredHeaderButton == "search")
+                }.accessibilityLabel(L("搜索文件", "Search Files")).onHover { headerHover("search", $0) }.help(L("搜索文件", "Search Files"))
+            }
+            if layoutControls && !narrow {
                 Button { app.toggleMaximum(id, itemCount: files(z).count, extraHeight: searchVisible ? 46 : 0) } label: {
                     HeaderButtonIcon(symbol: z.isMaximized ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right", hovered: hoveredHeaderButton == "maximum", iconFont: .system(size: 11, weight: .medium))
                 }.onHover { headerHover("maximum", $0) }.help(z.isMaximized ? L("还原分区", "Restore Partition Size") : L("按文件数量在原位置展开；文件已放得下时保持大小", "Expand here to fit the files. Keep the current size if they already fit."))
                     .accessibilityLabel(z.isMaximized ? L("还原分区", "Restore Partition Size") : L("放大分区", "Expand Partition to Fit"))
             }
-            Menu {
-                Button(L("添加文档、图片或文件夹…", "Add Documents, Images, or Folders…")) { app.chooseFiles(id) }.disabled(z.locked)
-                Picker(L("拖入方式", "Import Mode"), selection: Binding(get: { z.usesStorage }, set: { value in app.change(id) { $0.organizeFiles = value } })) {
-                    Text(L("收纳文件（移动，可撤销）", "Collect Files (Move, Undo Available)")).tag(true)
-                    Text(L("仅添加引用（原路径不变）", "Add References Only (Keep Originals)")).tag(false)
-                }
-                Picker(L("排序", "Sort By"), selection: Binding(get: { z.sortOrder ?? "manual" }, set: { value in app.change(id) { $0.sortOrder = value } })) {
-                    Text(L("手动排列（拖动排序）", "Manual Order (Drag to Reorder)")).tag("manual"); Text(L("文件名称", "File Name")).tag("name"); Text(L("最近修改", "Last Modified")).tag("modified"); Text(L("文件类型", "File Type")).tag("type")
-                }
-                Button(L("打开本区收纳文件夹", "Open This Partition's Storage Folder")) { app.openZoneFolder(id) }
-                Divider()
-                Button(L("重命名分区", "Rename Partition")) { app.rename(id) }
-                Button(z.locked ? L("解锁分区（允许移动文件和分区）", "Unlock Partition (Allow Moving Files and Partition)") : L("锁定分区（固定位置与文件）", "Lock Partition (Fix Position and Files)")) { app.lock(id) }
-                Button(L("新增分区（向右排列）", "Add Partition to the Right")) { app.addZone() }
-                Button(z.paths.isEmpty ? L("删除空分区…", "Delete Empty Partition…") : L("删除分区…", "Delete Partition…")) { app.deletePartition(id) }
-                Button(L("恢复上次删除的分区", "Restore Last Deleted Partition")) { app.restorePartition() }.disabled(app.partitionArchive.restorable(in: app.store) == nil)
-                Button(L("撤销上次操作", "Undo Last Action")) { app.undoStorage() }.disabled(app.storage.undoRecord == nil)
-                Button(L("操作记录", "Activity History")) { app.showHistory() }
-                Button(L("放回桌面层", "Return to Desktop Layer")) { app.backToDesktop() }
-                Button(L("使用说明", "Help")) { app.help() }
-            } label: { HeaderButtonIcon(symbol: "ellipsis", hovered: false) }
-                .accessibilityLabel(L("更多", "More")).help(L("更多", "More"))
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().frame(width: 34, height: 34).onHover { headerHover("menu", $0) }
+            if !narrow {
+                HeaderLockButton(app: app, id: id, locked: z.locked, onHover: { headerHover("lock", $0) })
+                    .frame(width: 34, height: 34).contentShape(Rectangle())
+                    .background { ControlHoverBackground(hovered: hoveredHeaderButton == "lock") }
+                    .onHover { headerHover("lock", $0) }
+            }
+            PartitionMenuButton(makeMenu: { partitionMenu(compact: compact, narrow: narrow) }, onClose: { headerHover("menu", false) })
+                .frame(width: 34, height: 34).onHover { headerHover("menu", $0) }
                 .background(RoundedRectangle(cornerRadius: 8).fill(.white.opacity(hoveredHeaderButton == "menu" ? 0.16 : 0)))
                 .overlay { RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(hoveredHeaderButton == "menu" ? 0.12 : 0), lineWidth: 0.7).allowsHitTesting(false) }
                 .background { MenuHoverTracker { headerHover("menu", $0) }.frame(width: 34, height: 34) }
-        }.buttonStyle(.plain).padding(.horizontal, 12).frame(height: 46)
+        }.buttonStyle(.plain).padding(.horizontal, 10).frame(height: PartitionHeaderLayout.height)
         .overlay(alignment: .bottom) { if !z.isCollapsed { Rectangle().fill(.white.opacity(0.15)).frame(height: 0.5).padding(.horizontal, 12) } }
     }
     func footer(_ z: Zone) -> some View {
         HStack(spacing: 6) {
             Spacer(minLength: 2)
-            if app.selectedZone == id && app.selectedPaths.count > 1 { Text(L("已选 \(app.selectedPaths.count) 项", "\(app.selectedPaths.count) items selected")).foregroundStyle(.white) }
-            if z.locked { Image(systemName: "lock.fill") }
+            if app.selectedZone == id && app.selectedPaths.count > 1 { Text(L("已选 \(app.selectedPaths.count) 项", "\(app.selectedPaths.count) items selected")).foregroundStyle(.white).lineLimit(1).truncationMode(.tail) }
+
             Image(systemName: "line.3.horizontal.decrease").rotationEffect(.degrees(-45)).foregroundStyle(.white.opacity(0.9))
-                .overlay { if layoutControls { ResizeHandle(locked: z.locked || z.isMaximized).frame(width: 26, height: 22) } }
+                .frame(width: 34, height: 26).contentShape(Rectangle())
+                .background { ControlHoverBackground(hovered: hoveredResize) }
+                .overlay { if layoutControls { ResizeHandle(locked: z.locked || z.isMaximized, onHover: { hoveredResize = $0 }).frame(width: 34, height: 26) } }
+                .onHover { hoveredResize = $0 }
+                .help(z.locked ? L("分区已锁定，请先解锁后调整大小", "Unlock this partition to resize it") : (z.isMaximized ? L("请先还原分区后调整大小", "Restore the partition before resizing it") : L("在灰白区域内按住拖动，可调整分区大小", "Drag anywhere in this area to resize the partition")))
         }.font(.system(size: 9)).foregroundStyle(.white.opacity(0.55)).padding(.horizontal, 14).frame(height: 26)
     }
     func fileTile(_ path: String) -> some View {
         let url = URL(fileURLWithPath: path)
         let missing = app.store.unavailable.contains(path)
-        let managed = app.storage.isManaged(url)
         let image = missing ? (NSImage(systemSymbolName: "doc.badge.ellipsis", accessibilityDescription: L("原文件暂不可用", "Original File Unavailable")) ?? NSImage()) : app.fileImage(path)
         let selected = app.selectedZone == id && app.selectedPaths.contains(path)
-        return VStack(spacing: 3) {
-            VStack(spacing: 4) {
-                Image(nsImage: image).resizable().aspectRatio(contentMode: .fit).frame(width: 44, height: 42).opacity(missing ? 0.55 : 1)
-                Text(url.lastPathComponent).font(.system(size: 11)).lineLimit(2).multilineTextAlignment(.center).frame(height: 29, alignment: .top)
-            }.frame(maxWidth: .infinity).contentShape(Rectangle())
-                .overlay { TileInteraction(app: app, zone: id, path: path, icon: image, orderedPaths: files(app.zone(id))) }
-            if missing {
-                Text(L("原文件暂不可用", "Original File Unavailable")).font(.system(size: 9)).foregroundStyle(.orange)
-                if !app.zone(id).locked {
-                    Button { app.remove(path, id) } label: {
-                        Label(L("移除", "Remove"), systemImage: "xmark.circle").font(.system(size: 10))
-                    }.buttonStyle(.plain).help(L("只移除本区的失效记录，不删除原文件", "Remove only this unavailable entry. The original file is not deleted."))
-                        .accessibilityLabel(L("移除失效条目 ", "Remove unavailable entry ") + url.lastPathComponent)
-                }
-            }
-            else {
-                Text(fileSize(url)).font(.system(size: 10)).foregroundStyle(.white.opacity(0.8))
-                HStack(spacing: 7) {
-                    Text(managed ? L("已收纳", "Collected") : L("引用", "Reference")).opacity(0.5)
-                    Button { app.previewReference(path, in: id) } label: { Image(systemName: "eye").frame(width: 17, height: 15) }.buttonStyle(.plain).help(L("预览 ", "Preview ") + url.lastPathComponent).accessibilityLabel(L("预览 ", "Preview ") + url.lastPathComponent)
-                }.font(.system(size: 9)).foregroundStyle(.white.opacity(0.7))
-            }
-        }.frame(maxWidth: .infinity).padding(.vertical, 3)
+        let hovered = app.hoveredFile?.zone == id && app.hoveredFile?.path == path
+        return VStack(spacing: 4) {
+            Image(nsImage: image).resizable().aspectRatio(contentMode: .fit).frame(width: 44, height: 42).opacity(missing ? 0.55 : 1)
+            Text(url.lastPathComponent).font(.system(size: 11)).lineLimit(2).multilineTextAlignment(.center).frame(height: 29, alignment: .top)
+        }.frame(maxWidth: .infinity).contentShape(Rectangle()).padding(.vertical, 3)
+        // The transparent preview replaces these visuals, avoiding duplicate
+        // text beneath the full name. The native mouse target stays unchanged.
+        .opacity(hovered ? 0 : 1)
         .frame(height: GridDropLayout.rowHeight, alignment: .top)
         .background { GridCellProbe(app: app, zone: id, path: path) }
-        .background(RoundedRectangle(cornerRadius: 9).fill(selected ? Color.white.opacity(0.14) : .clear))
-        .help(missing ? L("原文件暂不可用，引用已保留：", "Original file unavailable; reference kept: ") + path : path + (app.zone(id).locked ? L("\n分区已锁定，禁止拖出", "\nPartition locked. Dragging out is disabled.") : L("\n拖到桌面会移动文件，原分区不再保留", "\nDragging to the desktop moves the file and removes it from this partition.")))
-    }
-    func fileSize(_ url: URL) -> String {
-        app.sizeCache[url.path] ?? "—"
+        .overlay { TileInteraction(app: app, zone: id, path: path, icon: image, orderedPaths: files(app.zone(id))) }
+        .background(RoundedRectangle(cornerRadius: 9).fill(selected && !hovered ? Color.white.opacity(0.14) : .clear))
+        .accessibilityHint(missing ? L("原文件暂不可用，引用已保留：", "Original file unavailable; reference kept: ") + path : path)
     }
 }
-struct HoverCard: View {
+// Draw only the icon and complete filename. No fill, material, border, or
+// window shadow is used, and no line-count or truncation limit is applied.
+final class FullNameHoverView: NSView {
+    static let baseIconSize = NSSize(width: 44 * 1.3, height: 42 * 1.3)
+    static let inset: CGFloat = 4
+    let iconSize: NSSize
     let name: String
     let icon: NSImage
-    var body: some View {
-        VStack(spacing: 9) {
-            Image(nsImage: icon).resizable().aspectRatio(contentMode: .fit).frame(width: 58, height: 54)
-            Text(name).font(.system(size: 13, weight: .medium)).lineSpacing(1).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
-        }.padding(12).frame(maxWidth: .infinity, maxHeight: .infinity)
-        .foregroundStyle(.white).background(RoundedRectangle(cornerRadius: 14).fill(Color(red: 0.10, green: 0.14, blue: 0.18).opacity(0.96)))
-        .overlay { RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.25), lineWidth: 0.7) }
-        .clipShape(RoundedRectangle(cornerRadius: 14)).allowsHitTesting(false)
+    let title: NSAttributedString
+    let titleRect: NSRect
+    override var isOpaque: Bool { false }
+    init(name: String, icon: NSImage, availableSize: NSSize) {
+        self.name = name; self.icon = icon
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byCharWrapping
+        paragraph.lineSpacing = 1
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.75)
+        shadow.shadowBlurRadius = 1.5; shadow.shadowOffset = NSSize(width: 0, height: -1)
+        let text = NSAttributedString(string: name, attributes: [
+            .font: NSFont.systemFont(ofSize: 14, weight: .medium),
+            .foregroundColor: NSColor.white, .paragraphStyle: paragraph, .shadow: shadow
+        ])
+        title = text
+        let maxWidth = max(1, availableSize.width - 2 * Self.inset)
+        var width = min(maxWidth, Self.baseIconSize.width)
+        func textHeight(_ width: CGFloat) -> CGFloat {
+            ceil(text.boundingRect(with: NSSize(width: max(1, width), height: 10000),
+                                    options: [.usesLineFragmentOrigin, .usesFontLeading]).height) + 2
+        }
+        var height = textHeight(width)
+        func totalHeight(_ width: CGFloat, _ textHeight: CGFloat) -> CGFloat {
+            width * 42 / 44 + 4 + 2 * Self.inset + textHeight
+        }
+        // Normal names grow downward at 1.3x icon size. Extremely long names
+        // enlarge icon and text column together only when needed to fit a screen.
+        // The title always has exactly the same width as its displayed icon.
+        var candidate = width
+        while totalHeight(width, height) > availableSize.height && candidate < maxWidth {
+            candidate = min(maxWidth, candidate + 4)
+            let candidateHeight = textHeight(candidate)
+            if totalHeight(candidate, candidateHeight) < totalHeight(width, height) {
+                width = candidate; height = candidateHeight
+            }
+        }
+        iconSize = NSSize(width: width, height: width * 42 / 44)
+        titleRect = NSRect(x: Self.inset, y: Self.inset, width: width, height: height)
+        super.init(frame: NSRect(x: 0, y: 0, width: width + 2 * Self.inset, height: totalHeight(width, height)))
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        setAccessibilityLabel(name)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+    override func draw(_ dirtyRect: NSRect) {
+        icon.draw(in: NSRect(x: Self.inset,
+                             y: bounds.height - Self.inset - iconSize.height,
+                             width: iconSize.width, height: iconSize.height),
+                  from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        title.draw(with: titleRect, options: [.usesLineFragmentOrigin, .usesFontLeading])
     }
 }
 struct HistoryView: View {
@@ -1341,7 +1709,7 @@ func bootTrace(_ message: String) {
 }
 bootTrace("entry " + Bundle.main.bundleURL.path)
 let application = NSApplication.shared
-application.setActivationPolicy(.accessory)
+application.setActivationPolicy(.regular)
 bootTrace("application-created")
 let delegate = AppState()
 bootTrace("delegate-created")
